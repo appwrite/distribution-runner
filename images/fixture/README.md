@@ -63,7 +63,7 @@ Their names avoid the `DISTRIBUTION_` and `APPWRITE_` prefixes, which the server
 
 ## The committed bundle
 
-`app-unsigned.aab` has identifier `io.appwrite.distribution.fixture`, versionName `1.0.0`, versionCode `1`, minSdk 24, targetSdk 36 and `android:hasCode="false"`. `provenance.json` records the tools and checksums that produced it.
+`app-unsigned.aab` has identifier `io.appwrite.distribution.fixture`, versionName `1.0.0`, versionCode `1`, minSdk 24, targetSdk 36 and `android:hasCode="false"`. It was generated on `linux/amd64` by GitHub Actions run 45111799251 of the `Fixture` workflow (`.github/workflows/fixture.yml`) with the Linux `aapt2`, and is reproducible: regenerating it with the pinned inputs yields the same bytes (SHA-256 `51627b51c597a259f79f1276f549aa81bbd64f1bd4b0058caec48b28bf775be8`). `provenance.json` records the tools and checksums that produced it.
 
 Regenerate it with `make fixture-generate`, which runs `generate.sh` in a pinned `linux/amd64` Debian container: it downloads aapt2, the `platforms;android-36` `android.jar` and bundletool with pinned checksums, links the manifest in proto format, builds the bundle twice to confirm it is deterministic, checks that it is unsigned and passes `bundletool validate`, and reads the manifest back. Only `app-unsigned.aab` and `provenance.json` are committed. If `aapt2` cannot run under emulation, dispatch the `Fixture` workflow on an amd64 runner (see the root README).
 
