@@ -126,8 +126,9 @@ if type(result.get('versionCode')) is not int:
 
 with zipfile.ZipFile(bundle_path) as bundle:
     signatures = [
-        name for name in bundle.namelist()
-        if name.upper().startswith('META-INF/') and name.count('/') == 1 and name.upper().endswith(('.SF', '.RSA', '.DSA', '.EC'))
+        name for name in (entry.upper() for entry in bundle.namelist())
+        if name.startswith('META-INF/') and '/' not in name[9:]
+        and (name.endswith(('.SF', '.RSA', '.DSA', '.EC')) or name[9:].startswith('SIG-'))
     ]
 if signatures:
     problems.append(f'the bundle has signature entries: {signatures}')

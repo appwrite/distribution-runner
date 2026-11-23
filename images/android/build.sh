@@ -394,15 +394,22 @@ import sys
 import zipfile
 
 extensions = ('.SF', '.RSA', '.DSA', '.EC')
+
+
+def is_signature(name):
+    name = name.upper()
+    if not name.startswith('META-INF/'):
+        return False
+    file = name[len('META-INF/'):]
+    return '/' not in file and (file.endswith(extensions) or file.startswith('SIG-'))
+
+
 try:
     with zipfile.ZipFile(sys.argv[1]) as bundle:
         names = bundle.namelist()
 except (OSError, zipfile.BadZipFile) as error:
     sys.exit(f'[distribution] the bundle is not a readable zip: {error}')
-signed = [
-    name for name in names
-    if name.upper().startswith('META-INF/') and name.count('/') == 1 and name.upper().endswith(extensions)
-]
+signed = [name for name in names if is_signature(name)]
 sys.exit(3 if signed else 0)
 PYTHON
   case $status in
