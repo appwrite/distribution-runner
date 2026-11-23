@@ -14,16 +14,22 @@ import (
 const (
 	// eventOverhead bounds everything in a log event except its lines: id, type, time, stream and punctuation.
 	eventOverhead = 1024
-	// backlogBytes is how much queued output makes Log wait for a send, pushing back on whoever writes it.
+	// lineOverhead is what a line costs beyond its bytes, in the backlog and against the log limit: the string header
+	// that holds it, which also covers its newline and its JSON quotes and comma.
+	lineOverhead = 16
+	// backlogBytes is how much output, queued or in a send that has not succeeded yet, makes Log wait, pushing back on
+	// whoever writes it.
 	backlogBytes = 4 * MaxBatchBytes
-	// LogLimit is the server's default _APP_DISTRIBUTION_LOGS_LIMIT: the bytes of output one lease may report.
+	// LogLimit is the server's default _APP_DISTRIBUTION_LOGS_LIMIT: the bytes of output one lease may report, each
+	// line charged lineOverhead on top of its bytes so a flood of empty lines is truncated too.
 	LogLimit = 50_000_000
 )
 
 // Reporter queues events and log lines and sends them in order: every interval, as soon as a full request is
 // waiting, and on Flush or Close. A batch that fails transiently stays queued and is resent; one the server
 // rejects outright is dropped and its error returned by Close. While more than backlogBytes wait to be sent, Log
-// blocks; past LogLimit bytes of output it reports one truncation line and drops the rest.
+// blocks, including while those bytes are being sent or resent; past LogLimit it reports one truncation line and
+// drops the rest.
 type Reporter struct {
 	session *Session
 	wake    chan struct{}
@@ -41,6 +47,7 @@ type Reporter struct {
 	truncated   bool
 	pending     []Event
 	pendingSize int
+	inFlight    int
 	tailSize    int
 	failure     error
 	writers     []*lineWriter
@@ -62,24 +69,26 @@ func NewReporter(session *Session, interval time.Duration) *Reporter {
 }
 
 // Log queues one line of output, folded into pieces of at most MaxLineBytes. It waits while the backlog is full,
-// until a send drains it or the reporter closes.
+// until a send delivers part of it or the reporter closes; a line that still finds the backlog full once the reporter
+// has closed is dropped.
 func (r *Reporter) Log(stream string, line string) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
-	for r.pendingSize >= backlogBytes && !r.closed {
+	for !r.truncated && r.backlog() >= backlogBytes && !r.closed {
 		r.notify()
 		r.drained.Wait()
 	}
-	if r.truncated {
+	if r.truncated || r.backlog() >= backlogBytes {
 		return
 	}
-	if r.logged+int64(len(line)) > r.limit {
+	cost := int64(len(line)) + lineOverhead
+	if r.logged+cost > r.limit {
 		r.truncated = true
 		r.append(StreamStderr, fmt.Sprintf("[distribution] output truncated: the build wrote more than %d bytes", r.limit))
 		r.notify()
 		return
 	}
-	r.logged += int64(len(line))
+	r.logged += cost
 	for _, piece := range fold(line) {
 		r.append(stream, piece)
 	}
@@ -150,16 +159,20 @@ func (r *Reporter) run(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// backlog is the weight of everything not yet delivered: queued, or taken by a send that has not finished.
+func (r *Reporter) backlog() int {
+	return r.pendingSize + r.inFlight
+}
+
 func (r *Reporter) append(stream string, line string) {
-	encoded, _ := encode(line)
-	size := escapedLength(encoded) + 1
+	size := lineSize(line)
 	last := len(r.pending) - 1
 	if last >= 0 && r.tailSize > 0 && r.tailSize+size <= MaxEventBytes {
 		if data, ok := r.pending[last].Data.(LogData); ok && data.Stream == stream {
 			data.Lines = append(data.Lines, line)
 			r.pending[last].Data = data
 			r.tailSize += size
-			r.pendingSize += size
+			r.pendingSize += size + lineOverhead
 			return
 		}
 	}
@@ -167,7 +180,13 @@ func (r *Reporter) append(stream string, line string) {
 	r.session.stamp(&event)
 	r.pending = append(r.pending, event)
 	r.tailSize = eventOverhead + size
-	r.pendingSize += eventOverhead + size
+	r.pendingSize += eventOverhead + size + lineOverhead
+}
+
+// lineSize is the bytes a line adds to an event as the server measures it: its escaped JSON string and a comma.
+func lineSize(line string) int {
+	encoded, _ := encode(line)
+	return escapedLength(encoded) + 1
 }
 
 func (r *Reporter) notify() {
@@ -194,35 +213,52 @@ func (r *Reporter) flush(ctx context.Context) error {
 	return err
 }
 
+// take hands the queue to a send. Its weight stays in the backlog until the send delivers or drops it.
 func (r *Reporter) take() []Event {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 	events := r.pending
+	r.inFlight += r.pendingSize
 	r.pending = nil
 	r.pendingSize = 0
 	r.tailSize = 0
-	r.drained.Broadcast()
 	return events
 }
 
+// restore queues the events a send could not deliver again, ahead of what was logged meanwhile.
 func (r *Reporter) restore(events []Event) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 	r.pending = append(events, r.pending...)
-	for _, event := range events {
-		r.pendingSize += weight(event)
-	}
+	size := weights(events)
+	r.inFlight -= size
+	r.pendingSize += size
 	r.tailSize = 0
 }
 
-// weight is the share of the backlog an event takes: its overhead plus its escaped lines.
+// release takes events a send delivered or dropped for good out of the backlog and wakes the writers waiting on it.
+func (r *Reporter) release(events []Event) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	r.inFlight -= weights(events)
+	r.drained.Broadcast()
+}
+
+// weight is the share of the backlog an event takes: its overhead plus each line's size and overhead.
 func weight(event Event) int {
 	size := eventOverhead
 	if data, ok := event.Data.(LogData); ok {
 		for _, line := range data.Lines {
-			encoded, _ := encode(line)
-			size += escapedLength(encoded) + 1
+			size += lineSize(line) + lineOverhead
 		}
+	}
+	return size
+}
+
+func weights(events []Event) int {
+	size := 0
+	for _, event := range events {
+		size += weight(event)
 	}
 	return size
 }
@@ -235,6 +271,7 @@ func (r *Reporter) send(ctx context.Context, events []Event) ([]Event, error) {
 		data, err := r.session.encodeEvent(event)
 		if err != nil {
 			r.fail(err)
+			r.release([]Event{event})
 			continue
 		}
 		encoded = append(encoded, data)
@@ -249,6 +286,7 @@ func (r *Reporter) send(ctx context.Context, events []Event) ([]Event, error) {
 		if err != nil {
 			r.fail(err)
 		}
+		r.release(kept[sent : sent+len(batch)])
 		sent += len(batch)
 	}
 	return nil, nil

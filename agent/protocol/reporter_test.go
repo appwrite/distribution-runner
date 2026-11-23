@@ -331,7 +331,7 @@ func TestReporterTruncatesPastTheLogLimit(t *testing.T) {
 	server := newFake(t)
 	server.handle("POST "+leasePath+"/events", eventsHandler)
 	reporter := NewReporter(server.session(t), time.Hour)
-	reporter.limit = 10
+	reporter.limit = 2 * (5 + lineOverhead)
 
 	for _, line := range []string{"12345", "67890", "abc", "more"} {
 		reporter.Log(StreamStdout, line)
@@ -346,6 +346,102 @@ func TestReporterTruncatesPastTheLogLimit(t *testing.T) {
 	}
 	if events[1].Stream != StreamStderr || len(events[1].Lines) != 1 || !strings.Contains(events[1].Lines[0], "output truncated") {
 		t.Errorf("truncation event = %+v", events[1])
+	}
+}
+
+func TestReporterTruncatesAFloodOfEmptyLines(t *testing.T) {
+	server := newFake(t)
+	server.handle("POST "+leasePath+"/events", eventsHandler)
+	reporter := NewReporter(server.session(t), time.Hour)
+	reporter.limit = 100 * lineOverhead
+	writer := reporter.Writer(StreamStdout)
+
+	if _, err := io.WriteString(writer, strings.Repeat("\n", 10_000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := reporter.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	var empty, truncation int
+	for _, event := range receivedEvents(t, server) {
+		for _, line := range event.Lines {
+			switch {
+			case line == "":
+				empty++
+			case strings.Contains(line, "output truncated"):
+				truncation++
+			}
+		}
+	}
+	if empty != 100 || truncation != 1 {
+		t.Fatalf("delivered %d empty lines and %d truncation lines, want 100 and 1", empty, truncation)
+	}
+}
+
+func TestReporterHoldsTheBacklogWhileSendsFail(t *testing.T) {
+	server := newFake(t)
+	var failing atomic.Bool
+	failing.Store(true)
+	var failures, delivered atomic.Int32
+	server.handle("POST "+leasePath+"/events", func(writer http.ResponseWriter, request *http.Request) {
+		if failing.Load() {
+			failures.Add(1)
+			respond(t, writer, http.StatusServiceUnavailable, nil)
+			return
+		}
+		var received batch
+		if err := json.NewDecoder(request.Body).Decode(&received); err != nil {
+			t.Errorf("decode events: %v", err)
+		}
+		for _, event := range received.Events {
+			var data LogData
+			if err := json.Unmarshal(event.Data, &data); err != nil {
+				t.Errorf("decode log data: %v", err)
+			}
+			delivered.Add(int32(len(data.Lines)))
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	})
+	session := server.session(t)
+	session.client.retry = retry{attempts: 1, backoff: time.Millisecond, ceiling: time.Millisecond}
+	reporter := NewReporter(session, 5*time.Millisecond)
+	lines := 2 * backlogBytes / MaxLineBytes
+	bound := backlogBytes + weight(Event{Data: LogData{Lines: []string{strings.Repeat("x", MaxLineBytes)}}})
+
+	written, done := logLines(reporter, lines)
+	peak := 0
+	deadline := time.Now().Add(30 * time.Second)
+	for failures.Load() < 5 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the server refused only %d sends, want the flood to span several retry cycles", failures.Load())
+		}
+		reporter.mutex.Lock()
+		peak = max(peak, reporter.backlog())
+		reporter.mutex.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	accepted := int(written.Load())
+	if peak > bound {
+		t.Fatalf("backlog peaked at %d bytes while every send failed, want at most %d", peak, bound)
+	}
+	if accepted*MaxLineBytes > bound {
+		t.Fatalf("Log accepted %d lines (%d bytes) while nothing was delivered, want at most %d bytes", accepted, accepted*MaxLineBytes, bound)
+	}
+	failing.Store(false)
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the writer stayed blocked after the server recovered")
+	}
+	if err := reporter.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := int(delivered.Load()); got != lines {
+		t.Errorf("delivered %d lines, want each of the %d exactly once", got, lines)
+	}
+	if reporter.backlog() != 0 {
+		t.Errorf("backlog = %d after Close, want 0", reporter.backlog())
 	}
 }
 
