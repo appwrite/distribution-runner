@@ -71,6 +71,18 @@ def build_settings
   settings.map { |key, value| "#{key}=#{value}".shellescape }.join(' ')
 end
 
+# The lane runs from image binaries only; the build command gets back the PATH and GEM_HOME build.sh gave the install
+# command, so tools the install command added still work there.
+def with_build_environment
+  saved = ENV.to_h
+  ENV['PATH'] = ENV.fetch('DISTRIBUTION_BUILD_PATH', ENV.fetch('PATH'))
+  gem_home = ENV.fetch('DISTRIBUTION_BUILD_GEM_HOME', '')
+  ENV['GEM_HOME'] = gem_home unless gem_home.empty?
+  yield
+ensure
+  ENV.replace(saved)
+end
+
 def ignore_gymfiles(directory)
   GYMFILES.each do |name|
     path = File.join(directory, name)
@@ -91,7 +103,7 @@ platform :ios do
 
     command = ENV.fetch('DISTRIBUTION_BUILD_COMMAND', '')
     unless command.empty?
-      run = -> { sh(command: command, chdir: root) }
+      run = -> { with_build_environment { sh(command: command, chdir: root) } }
       defined?(Bundler) ? Bundler.with_unbundled_env(&run) : run.call
     end
 

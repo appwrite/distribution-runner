@@ -87,7 +87,10 @@ install_files() {
   sudo install -o root -g wheel -m 0644 "$repository/lanes/Gemfile" "$repository/lanes/Gemfile.lock" \
     "$repository/vm/versions.env" "$repository/vm/labels" "$home/"
   sudo install -o root -g wheel -m 0755 "$repository/scripts/build-ios.sh" "$home/build.sh"
-  sudo install -d -o "$user" -g staff -m 0755 "$home/ruby" "$home/vendor" "$home/.bundle" "$home/flutter"
+  sudo install -o root -g wheel -m 0755 "$repository/vm/host-key.sh" "$home/host-key.sh"
+  sudo install -d -o root -g wheel -m 0755 "$home/cocoapods"
+  sudo install -o root -g wheel -m 0644 "$repository/vm/cocoapods/Gemfile" "$repository/vm/cocoapods/Gemfile.lock" "$home/cocoapods/"
+  sudo install -d -o "$user" -g staff -m 0755 "$home/ruby" "$home/vendor" "$home/.bundle" "$home/flutter" "$home/cocoapods/.bundle"
 }
 
 install_ruby() {
@@ -128,7 +131,13 @@ install_gems() {
   bundler=$(locked_bundler)
   info "gems: bundler $bundler, cocoapods $COCOAPODS_VERSION, fastlane $FASTLANE_VERSION"
   gem install --no-document bundler --version "$bundler"
-  gem install --no-document cocoapods --version "$COCOAPODS_VERSION"
+  (
+    cd -- "$home/cocoapods"
+    export BUNDLE_GEMFILE=$home/cocoapods/Gemfile
+    bundle config set --local frozen true
+    bundle config set --local path.system true
+    bundle install --jobs "$(sysctl -n hw.ncpu)"
+  )
   (
     cd -- "$home"
     BUNDLE_GEMFILE=$home/Gemfile bundle config set --local deployment true
@@ -208,6 +217,18 @@ configure_system() {
   done
 }
 
+check_cocoapods_lock() {
+  if ! grep -q "^    cocoapods ($COCOAPODS_VERSION)\$" "$repository/vm/cocoapods/Gemfile.lock"; then
+    fail "vm/cocoapods/Gemfile.lock does not lock cocoapods $COCOAPODS_VERSION"
+  fi
+}
+
+install_host_key_daemon() {
+  info 'ssh: per-machine host keys'
+  sudo install -o root -g wheel -m 0644 "$repository/vm/io.appwrite.distribution.host-key.plist" /Library/LaunchDaemons/
+  sudo rm -f /etc/ssh/ssh_host_*
+}
+
 check_signing_state() {
   local directory
   if defaults read com.apple.dt.Xcode DVTDeveloperAccountManagerAppleIDLists > /dev/null 2>&1; then
@@ -223,19 +244,43 @@ check_signing_state() {
   done
 }
 
+# lock_account gives the guest user a random password nobody keeps and takes it out of admin, so build code cannot
+# become root to read another machine's secrets or reconfigure the guest. The autologin password file is rewritten to
+# match, and the login keychain, encrypted with the old password, is removed for macOS to recreate at the next login.
+# This is the last step that needs sudo: afterwards the image has no admin account.
+lock_account() {
+  local password membership
+  info "account: $user gets a random password and leaves the admin group"
+  password=$(/usr/bin/openssl rand -hex 32)
+  sudo /usr/bin/dscl . -passwd "/Users/$user" "$password"
+  printf '%s' "$password" | /usr/bin/python3 -I -c '
+import sys
+key = bytes([0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD, 0xEA, 0xA3, 0xB9, 0x1F])
+plain = sys.stdin.buffer.read()
+plain += bytes(-len(plain) % 12)
+sys.stdout.buffer.write(bytes(byte ^ key[index % len(key)] for index, byte in enumerate(plain)))
+' | sudo /usr/bin/tee /etc/kcpassword > /dev/null
+  password=''
+  sudo /usr/sbin/chown root:wheel /etc/kcpassword
+  sudo /bin/chmod 0600 /etc/kcpassword
+  rm -f -- "$HOME/Library/Keychains/login.keychain-db"
+  sudo /usr/sbin/dseditgroup -o edit -d "$user" -t user admin
+  sudo -k
+  membership=$(/usr/sbin/dseditgroup -o checkmember -m "$user" admin) || true
+  if [[ $membership != *'NOT a member'* ]]; then
+    fail "$user is still an admin: $membership"
+  fi
+}
+
 finish() {
   sudo chown -R root:wheel "$home"
   sudo chown -R "$user:staff" "$home/flutter"
-  sudo -k
-  info "image: $IMAGE"
-  info "labels: $(paste -sd , "$home/labels")"
-  info 'host key for the agent known_hosts file:'
-  cat /etc/ssh/ssh_host_ed25519_key.pub
 }
 
 main() {
   trap cleanup EXIT
   check_labels
+  check_cocoapods_lock
   check_guest
   check_xcode
   scratch=$(mktemp -d)
@@ -248,7 +293,12 @@ main() {
   install_intermediates
   configure_system
   check_signing_state
+  install_host_key_daemon
   finish
+  lock_account
+  info "image: $IMAGE"
+  info "labels: $(paste -sd , "$home/labels")"
+  info 'done: the image has no admin account and no ssh host key of its own; stop it now'
 }
 
 main "$@"

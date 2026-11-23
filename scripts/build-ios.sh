@@ -33,6 +33,7 @@ export LANG=${LANG:-en_US.UTF-8}
 export LC_ALL=${LC_ALL:-en_US.UTF-8}
 export GEM_HOME=$HOME/.gem
 export npm_config_prefix=$HOME/.npm-global
+readonly image_path=$home/ruby/bin:$home/node/bin:$home/flutter/bin:/usr/bin:/bin:/usr/sbin:/sbin
 export PATH=$GEM_HOME/bin:$npm_config_prefix/bin:$home/ruby/bin:$home/node/bin:$home/flutter/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
 keychain_password=''
@@ -52,6 +53,22 @@ fail() {
   shift
   printf '[distribution] %s\n' "$*" >&2
   exit "$code"
+}
+
+# keychain runs one security(1) command with its arguments on standard input (security -i), so passwords never appear
+# in a process's arguments. security splits the line on whitespace outside double quotes, where a backslash escapes the
+# next character (SecurityTool/macOS/security.c, split_line); a line ends at a newline, so values may not hold one.
+keychain() {
+  local line='' argument backslash=$'\\' quote=$'"'
+  for argument in "$@"; do
+    case $argument in
+      *$'\n'* | *$'\r'*) return 64 ;;
+    esac
+    argument=${argument//"$backslash"/"$backslash$backslash"}
+    argument=${argument//"$quote"/"$backslash$quote"}
+    line+="$quote$argument$quote "
+  done
+  printf '%s\n' "$line" | security -i
 }
 
 setting() {
@@ -132,7 +149,7 @@ save_search_list() {
 
 import_identity() {
   local password=$1 status=0
-  if security import "$signing/certificate.p12" -k "$keychain" -f pkcs12 -P "$password" -T /usr/bin/codesign > /dev/null; then
+  if keychain import "$signing/certificate.p12" -k "$keychain" -f pkcs12 -P "$password" -T /usr/bin/codesign > /dev/null; then
     return 0
   fi
   info 'keychain: import refused, retrying with legacy PKCS#12 encryption'
@@ -147,7 +164,7 @@ import_identity() {
   if ((status != 0)); then
     return "$status"
   fi
-  security import "$work/legacy.p12" -k "$keychain" -f pkcs12 -P "$password" -T /usr/bin/codesign > /dev/null
+  keychain import "$work/legacy.p12" -k "$keychain" -f pkcs12 -P "$password" -T /usr/bin/codesign > /dev/null
 }
 
 select_identity() {
@@ -176,16 +193,16 @@ create_keychain() {
   rm -f -- "$signing/password"
   keychain_password=$(/usr/bin/openssl rand -hex 32)
   save_search_list
-  security create-keychain -p "$keychain_password" "$keychain"
+  keychain create-keychain -p "$keychain_password" "$keychain"
   security set-keychain-settings -lut 21600 "$keychain"
-  security unlock-keychain -p "$keychain_password" "$keychain"
+  keychain unlock-keychain -p "$keychain_password" "$keychain"
   security list-keychains -d user -s "$keychain" ${search_list[@]+"${search_list[@]}"}
   if ! import_identity "$password"; then
     fail 4 'keychain: the signing certificate could not be imported'
   fi
   password=''
   rm -f -- "$signing/certificate.p12" "$work/legacy.p12"
-  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+  keychain set-key-partition-list -S apple: -s -k "$keychain_password" "$keychain" > /dev/null
   select_identity
 }
 
@@ -287,9 +304,11 @@ install_dependencies() {
   (cd -- "$1" && /bin/sh -c "$DISTRIBUTION_INSTALL_COMMAND") || fail 1 'install: the install command failed'
 }
 
+# run_lane starts fastlane from image binaries only: the install command could have put a bundle, ruby or gem of its
+# own on the customer PATH or in GEM_HOME. The customer PATH and GEM_HOME come back for the build command alone.
 run_lane() {
   local name
-  security unlock-keychain -p "$keychain_password" "$keychain"
+  keychain unlock-keychain -p "$keychain_password" "$keychain"
   info "build: ${DISTRIBUTION_BUILD_COMMAND:-no build command}, then archive"
   (
     for name in $(compgen -e); do
@@ -298,10 +317,13 @@ run_lane() {
       esac
     done
     cd -- "$home"
-    export BUNDLE_GEMFILE=$home/Gemfile
+    export DISTRIBUTION_BUILD_PATH=$PATH DISTRIBUTION_BUILD_GEM_HOME=$GEM_HOME
+    unset GEM_HOME GEM_PATH
+    export PATH=$image_path
+    export BUNDLE_GEMFILE=$home/Gemfile BUNDLE_APP_CONFIG=$home/.bundle BUNDLE_USER_HOME=$build/bundle
     export FASTLANE_SKIP_UPDATE_CHECK=1 FASTLANE_OPT_OUT_USAGE=1 FASTLANE_HIDE_CHANGELOG=1 FASTLANE_DISABLE_COLORS=1
     export FL_REPORT_PATH=$build DISTRIBUTION_ARCHIVE_PATH=$archive DISTRIBUTION_SIGNING_IDENTITY=$identity_name
-    exec bundle exec fastlane ios build
+    exec "$home/ruby/bin/bundle" exec fastlane ios build
   ) || fail 1 'build: the fastlane lane failed'
   if [[ ! -d $archive ]]; then
     fail 1 "build: no archive at $archive"
@@ -353,7 +375,8 @@ with zipfile.ZipFile(package) as bundle:
         if entry.startswith('Payload/') and entry.count('/') == 2 and entry.endswith('.app/Info.plist')
     ]
     if len(plists) != 1:
-        sys.exit(f'[distribution] expected one application in the package, found {len(plists)}')
+        print(f'[distribution] expected one application in the package, found {len(plists)}', file=sys.stderr)
+        sys.exit(5)
     info = plistlib.loads(bundle.read(plists[0]))
 
 built = {
