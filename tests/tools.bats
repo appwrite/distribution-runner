@@ -218,6 +218,30 @@ assert_verification_fails() {
   assert_not_signed
 }
 
+@test 'sign: an end record whose comment does not end the file is refused with 3' {
+  write_bundle "$PKCS12_KEYSTORE" "$PKCS12_PASSWORD" upload "$PKCS12_PASSWORD"
+  tamper split-directory "$FIXTURE" "$BATS_TEST_TMPDIR/split.aab"
+
+  sign DISTRIBUTION_INPUT="$BATS_TEST_TMPDIR/split.aab"
+
+  assert_status 3
+  assert_stderr_contains 'end of central directory record does not end the file'
+  assert_bundle_consumed
+  assert_not_signed
+}
+
+@test 'sign: data prepended to the archive is refused with 3' {
+  write_bundle "$PKCS12_KEYSTORE" "$PKCS12_PASSWORD" upload "$PKCS12_PASSWORD"
+  tamper prepended "$FIXTURE" "$BATS_TEST_TMPDIR/prepended.aab"
+
+  sign DISTRIBUTION_INPUT="$BATS_TEST_TMPDIR/prepended.aab"
+
+  assert_status 3
+  assert_stderr_contains 'archive does not start with a local file header'
+  assert_bundle_consumed
+  assert_not_signed
+}
+
 @test 'sign: a version code of 0 or with a leading zero is refused with 7' {
   local code
   for code in 0 01; do
@@ -544,6 +568,36 @@ PYTHON
 
   assert_status 2
   assert_stderr_contains 'zip64 end of central directory record lies outside the file'
+  assert_missing "$WORKSPACE/output/result.json"
+}
+
+@test 'inspect: a zip64 record that disagrees with the end record is rejected with 2' {
+  tamper zip64-mismatch "$FIXTURE" "$BATS_TEST_TMPDIR/zip64.aab"
+
+  inspect aab "$BATS_TEST_TMPDIR/zip64.aab"
+
+  assert_status 2
+  assert_stderr_contains 'zip64 end of central directory record disagrees with the end of central directory record'
+  assert_missing "$WORKSPACE/output/result.json"
+}
+
+@test 'inspect: an end record whose comment does not end the file is rejected with 2' {
+  tamper split-directory "$FIXTURE" "$BATS_TEST_TMPDIR/split.aab"
+
+  inspect aab "$BATS_TEST_TMPDIR/split.aab"
+
+  assert_status 2
+  assert_stderr_contains 'end of central directory record does not end the file'
+  assert_missing "$WORKSPACE/output/result.json"
+}
+
+@test 'inspect: data prepended to the archive is rejected with 2' {
+  tamper prepended "$FIXTURE" "$BATS_TEST_TMPDIR/prepended.aab"
+
+  inspect aab "$BATS_TEST_TMPDIR/prepended.aab"
+
+  assert_status 2
+  assert_stderr_contains 'archive does not start with a local file header'
   assert_missing "$WORKSPACE/output/result.json"
 }
 
