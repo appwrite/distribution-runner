@@ -35,7 +35,14 @@ The image runs as root by default and works as any user that can write the works
 
 ## Archive ceilings
 
-Both jobs run `archive.py` first. It reads the end of central directory record (zip64 aware), refuses a central directory larger than its ceiling or not where the record says, then walks the directory headers itself, counting entries and stopping at the entry ceiling, before Python's `zipfile` builds anything. An end record whose entry count disagrees with the directory, duplicate names, encrypted entries, and compression other than stored or deflated are refused.
+Both jobs run `archive.py` first. It accepts only a layout that Python's `zipfile` and Java's `ZipFile` (used by `bundletool`, `jarsigner` and `keytool`) necessarily read as the same central directory. Java scans backwards for an end of central directory record and, when one's comment does not reach the end of the file, skips it for an earlier one; Python takes the last one and tolerates prepended data; Java ignores a zip64 record that disagrees with the 32-bit fields, Python always uses it. So:
+
+- the file starts with a local file header (`PK\x03\x04`): no prepended data;
+- the last end of central directory record in the file has a comment that ends exactly at the end of the file;
+- when a zip64 locator sits right before that record, it points at a 56-byte zip64 end record right before the locator, and every 32-bit field of the end record that is not the zip64 marker (`0xFFFF` / `0xFFFFFFFF`) equals its zip64 value;
+- the central directory starts at the offset the (zip64) end record gives and ends exactly where that record starts.
+
+It then refuses a central directory larger than its ceiling and walks the directory headers itself, counting entries and stopping at the entry ceiling, before Python's `zipfile` builds anything. An end record whose entry count disagrees with the directory, duplicate names, encrypted entries, and compression other than stored or deflated are refused.
 
 | Variable | Default | |
 |---|---|---|
@@ -88,7 +95,7 @@ Steps:
 | Exit | When |
 |---|---|
 | 0 | Signed, verified, outputs written |
-| 3 | Refused: package or version code mismatch, input not a readable zip, archive ceilings exceeded, end record that disagrees with the central directory, duplicate entry names, encrypted entries, unsupported compression, unreadable manifest, non-numeric SDK level |
+| 3 | Refused: package or version code mismatch, input not a readable zip, archive ceilings exceeded, a layout outside the accepted one above (prepended data, an end record that does not end the file, a zip64 record that disagrees with it, a central directory not where the record says), end record that disagrees with the central directory, duplicate entry names, encrypted entries, unsupported compression, unreadable manifest, non-numeric SDK level |
 | 4 | Refused: the input already carries a signature |
 | 5 | Signing failed: wrong store or key password, unknown alias, unreadable certificate, unsupported key algorithm, `jarsigner` error |
 | 6 | Verification failed: `jar verified.` missing, not exactly one signer, a digest or signature algorithm other than the pinned one, unsigned entries, an unreadable signer certificate, or a signer other than the keystore certificate |
@@ -130,7 +137,7 @@ For a bundle, `versionCode`, `minSdk` and `targetSdk` are integers and `entitlem
 | Exit | When |
 |---|---|
 | 0 | Inspected |
-| 2 | Malformed or over a ceiling: not a zip, too many entries, central directory too large or misplaced, end record that disagrees with the central directory, too large, duplicate names, encrypted entries, unsupported compression, corrupt entry data, missing manifest, `Info.plist` or executable, not a Mach-O file, truncated executable, or any other unreadable input |
+| 2 | Malformed or over a ceiling: not a zip, too many entries, central directory too large or misplaced, a layout outside the accepted one above (prepended data, an end record that does not end the file, a zip64 record that disagrees with it), end record that disagrees with the central directory, too large, duplicate names, encrypted entries, unsupported compression, corrupt entry data, missing manifest, `Info.plist` or executable, not a Mach-O file, truncated executable, or any other unreadable input |
 | 3 | Invalid: a bundle signature that does not verify, covers only some entries, has more than one signer or a weak algorithm; an IPA profile that does not verify against the trust bundle or is not signed by Apple's profile signing certificate, a CMS signature that does not verify over the CodeDirectory, a CodeDirectory that does not seal the reported identifier, `Info.plist` or entitlements, a team mismatch, a signer missing from the profile, or a profile application identifier that does not cover the bundle |
 | 4 | `DISTRIBUTION_ARTIFACT_TYPE` not `aab` or `ipa`, the input missing, or a `DISTRIBUTION_MAX_*` value that is not a positive integer |
 | 8 | A `bundletool`, `keytool` or `jarsigner` run took longer than `DISTRIBUTION_MAX_JAVA_SECONDS` |
@@ -139,6 +146,7 @@ For a bundle, `versionCode`, `minSdk` and `targetSdk` are integers and `entitlem
 ## Contract changes for the server
 
 - New exit code 8 (timeout) in both jobs; exit 1 no longer occurs for malformed input.
+- Archives with prepended data (self-extracting stubs) or trailing bytes after the end record's comment are now malformed (sign 3, inspect 2).
 - Inspect exit 3 now also covers a bundle with more than one signer or a weak algorithm, and an IPA whose profile signer is not Apple's, whose signature does not seal its `Info.plist`, identifier or entitlements, or whose profile application identifier does not cover it.
 - The ceilings are `DISTRIBUTION_MAX_*` (previously `MAX_ENTRIES`, `MAX_UNCOMPRESSED_BYTES`, `MAX_MANIFEST_BYTES`); `DISTRIBUTION_MAX_DIRECTORY_BYTES` and `DISTRIBUTION_MAX_JAVA_SECONDS` are new.
 - `DISTRIBUTION_TRUST` is ignored by the release image.

@@ -5,6 +5,7 @@ import struct
 import sys
 import zipfile
 
+LOCAL_HEADER = b'PK\x03\x04'
 END_OF_DIRECTORY = b'PK\x05\x06'
 ZIP64_LOCATOR = b'PK\x06\x07'
 ZIP64_END_OF_DIRECTORY = b'PK\x06\x06'
@@ -12,6 +13,7 @@ DIRECTORY_HEADER = b'PK\x01\x02'
 END_OF_DIRECTORY_BYTES = 22
 ZIP64_LOCATOR_BYTES = 20
 ZIP64_END_OF_DIRECTORY_BYTES = 56
+ZIP64_RECORD_SIZE_FIELD_BYTES = 12
 DIRECTORY_HEADER_BYTES = 46
 MAX_COMMENT_BYTES = 0xFFFF
 ZIP64_MARKER_16 = 0xFFFF
@@ -62,26 +64,37 @@ def end_records(handle, size):
     position = tail.rfind(END_OF_DIRECTORY)
     if position < 0 or position + END_OF_DIRECTORY_BYTES > len(tail):
         raise Rejected('not a zip archive: no end of central directory record')
+    entries, length, offset, comment = struct.unpack_from('<HIIH', tail, position + 10)
+    if position + END_OF_DIRECTORY_BYTES + comment != len(tail):
+        raise Rejected('end of central directory record does not end the file')
     end = size - window + position
-    entries, length, offset = struct.unpack_from('<HII', tail, position + 10)
-    if entries != ZIP64_MARKER_16 and ZIP64_MARKER_32 not in (length, offset):
+    if end < ZIP64_LOCATOR_BYTES:
         return end, entries, length, offset
-    locator = position - ZIP64_LOCATOR_BYTES
-    if locator < 0 or tail[locator:locator + 4] != ZIP64_LOCATOR:
+    handle.seek(end - ZIP64_LOCATOR_BYTES)
+    locator = handle.read(ZIP64_LOCATOR_BYTES)
+    if locator[:4] != ZIP64_LOCATOR:
         return end, entries, length, offset
-    record = struct.unpack_from('<Q', tail, locator + 8)[0]
+    record = struct.unpack_from('<Q', locator, 8)[0]
     if record + ZIP64_END_OF_DIRECTORY_BYTES > size:
         raise Rejected('zip64 end of central directory record lies outside the file')
+    if record + ZIP64_END_OF_DIRECTORY_BYTES + ZIP64_LOCATOR_BYTES != end:
+        raise Rejected('zip64 end of central directory record is not immediately before its locator')
     handle.seek(record)
     data = handle.read(ZIP64_END_OF_DIRECTORY_BYTES)
-    if len(data) < ZIP64_END_OF_DIRECTORY_BYTES or data[:4] != ZIP64_END_OF_DIRECTORY:
+    if data[:4] != ZIP64_END_OF_DIRECTORY or struct.unpack_from('<Q', data, 4)[0] != ZIP64_END_OF_DIRECTORY_BYTES - ZIP64_RECORD_SIZE_FIELD_BYTES:
         raise Rejected('malformed zip64 end of central directory record')
-    entries, length, offset = struct.unpack_from('<QQQ', data, 32)
-    return record, entries, length, offset
+    wide = struct.unpack_from('<QQQ', data, 32)
+    for narrow, value, marker in zip((entries, length, offset), wide, (ZIP64_MARKER_16, ZIP64_MARKER_32, ZIP64_MARKER_32)):
+        if narrow != marker and narrow != value:
+            raise Rejected('zip64 end of central directory record disagrees with the end of central directory record')
+    return (record, *wide)
 
 
 def count_directory(handle, size):
     end, declared, length, offset = end_records(handle, size)
+    handle.seek(0)
+    if handle.read(4) != LOCAL_HEADER:
+        raise Rejected('archive does not start with a local file header')
     limit = ceiling('DISTRIBUTION_MAX_DIRECTORY_BYTES')
     if length > limit:
         raise Rejected(f'central directory is {length} bytes, limit {limit}')
