@@ -23,14 +23,25 @@ const (
 	StatusOffline  = "offline"
 )
 
-const errorBodyBytes = 64 << 10
+const (
+	errorBodyBytes = 64 << 10
+	// RequestTimeout bounds one attempt of a JSON call, response body included.
+	RequestTimeout = 30 * time.Second
+	// UploadTimeout bounds one attempt of a chunk upload, and how long any request waits for response headers.
+	UploadTimeout = 5 * time.Minute
+)
 
+// forbiddenHeaders are the headers RFC §7.3 forbids the agent to send.
 var forbiddenHeaders = []string{
 	"X-Appwrite-Key",
 	"X-Appwrite-Jwt",
 	"X-Appwrite-Mode",
 	"X-Appwrite-Response-Format",
-	"Origin",
+}
+
+// reservedHeaders are set by the agent itself, so a lease query key must not name them either.
+var reservedHeaders = []string{
+	"X-Appwrite-Id",
 }
 
 type Client struct {
@@ -84,6 +95,11 @@ type ResponseError struct {
 	Message string
 }
 
+// Permanent reports whether the server refused the request itself, so repeating it cannot succeed.
+func (e *ResponseError) Permanent() bool {
+	return e.Status >= 400 && e.Status < 500 && e.Status != http.StatusTooManyRequests && e.Status != http.StatusRequestTimeout
+}
+
 func (e *ResponseError) Error() string {
 	if e.Message == "" {
 		return fmt.Sprintf("distribution: unexpected status %d", e.Status)
@@ -103,17 +119,21 @@ type call struct {
 	body        func() io.Reader
 	length      int64
 	retry       bool
+	timeout     time.Duration
 }
 
 // New returns a client for an Appwrite endpoint that includes /v1. The endpoint must be HTTPS unless allowHTTP is set.
-// The client never follows redirects, so a bearer token cannot be forwarded to another URL.
+// The client never follows redirects, so a bearer token cannot be forwarded to another URL. Every attempt of every
+// call has its own deadline, so a server that accepts a connection and never answers cannot wedge the caller.
 func New(endpoint string, client *http.Client, allowHTTP bool) (*Client, error) {
 	base, err := parseEndpoint(endpoint, allowHTTP)
 	if err != nil {
 		return nil, err
 	}
 	if client == nil {
-		client = &http.Client{}
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.ResponseHeaderTimeout = UploadTimeout
+		client = &http.Client{Transport: transport}
 	}
 	copied := *client
 	copied.CheckRedirect = func(*http.Request, []*http.Request) error {
@@ -189,6 +209,7 @@ func (c *Client) Claim(ctx context.Context, credentials Credentials, labels []st
 	if lease.LeaseID == "" || lease.Token == "" || lease.Endpoint == "" {
 		return nil, errors.New("distribution: lease has no id, token or endpoint")
 	}
+	lease.ExpiresAt = hostTime(lease.ExpiresAt, response.Header)
 	return &lease, nil
 }
 
@@ -256,7 +277,19 @@ func (c *Client) send(ctx context.Context, request call) (*http.Response, error)
 	}
 }
 
+// attempt sends the call once under its own deadline, which ends when the response body is closed.
 func (c *Client) attempt(ctx context.Context, request call) (*http.Response, error) {
+	ctx, cancel := context.WithTimeout(ctx, positive(request.timeout, RequestTimeout))
+	response, err := c.do(ctx, request)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	response.Body = &bounded{ReadCloser: response.Body, cancel: cancel}
+	return response, nil
+}
+
+func (c *Client) do(ctx context.Context, request call) (*http.Response, error) {
 	var body io.Reader
 	if request.body != nil {
 		body = request.body()
@@ -278,6 +311,37 @@ func (c *Client) attempt(ctx context.Context, request call) (*http.Response, err
 	outgoing.Header.Set("Accept", "application/json")
 	outgoing.Header.Set("Authorization", "Bearer "+request.token)
 	return c.http.Do(outgoing)
+}
+
+// bounded releases its attempt's deadline when the body is closed.
+type bounded struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *bounded) Close() error {
+	defer b.cancel()
+	return b.ReadCloser.Close()
+}
+
+// hostTime moves a server timestamp onto the host clock using the response's Date header, so a host clock that runs
+// ahead or behind does not shorten or stretch the lease. Without a usable Date it returns the timestamp unchanged.
+func hostTime(at time.Time, header http.Header) time.Time {
+	if at.IsZero() {
+		return at
+	}
+	served, err := http.ParseTime(header.Get("Date"))
+	if err != nil {
+		return at
+	}
+	return time.Now().Add(at.Sub(served))
+}
+
+func positive(value time.Duration, otherwise time.Duration) time.Duration {
+	if value <= 0 {
+		return otherwise
+	}
+	return value
 }
 
 func (r retry) delay(attempt int, retryAfter string) time.Duration {

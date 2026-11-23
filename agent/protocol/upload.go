@@ -3,6 +3,7 @@ package protocol
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,19 +24,21 @@ const (
 	UploadField       = "file"
 )
 
-// Upload sends the file at path in exact ChunkSize chunks: the first alone, to learn the upload id from its $id,
-// then the rest concurrently with that id. It returns the response that reports every chunk uploaded.
+// Upload sends the file at path in exact ChunkSize chunks under an upload id the agent mints, so a first chunk
+// resent after a lost response names the same upload instead of creating another. The first chunk goes alone, so the
+// server creates the upload once, then the rest concurrently. It returns the response that reports every chunk
+// uploaded, and fails when none does.
 func (s *Session) Upload(ctx context.Context, path string) (map[string]any, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	info, err := file.Stat()
+	information, err := file.Stat()
 	if err != nil {
 		return nil, err
 	}
-	size := info.Size()
+	size := information.Size()
 	if size == 0 {
 		return nil, errors.New("distribution: refusing to upload an empty file")
 	}
@@ -44,23 +47,23 @@ func (s *Session) Upload(ctx context.Context, path string) (map[string]any, erro
 		file:    file,
 		name:    filepath.Base(path),
 		size:    size,
+		id:      strings.ToLower(rand.Text()),
 	}
 	chunks := (size + ChunkSize - 1) / ChunkSize
 
-	first, err := upload.send(ctx, 0, "")
+	first, err := upload.send(ctx, 0)
 	if err != nil {
 		return nil, err
 	}
-	id, _ := first["$id"].(string)
-	if id == "" {
-		return nil, errors.New("distribution: first chunk response has no $id")
+	if id, ok := first["$id"].(string); ok && id != upload.id {
+		return nil, fmt.Errorf("distribution: the server named the upload %q, not %q", id, upload.id)
 	}
 	responses := make([]map[string]any, chunks)
 	responses[0] = first
-	if err := upload.rest(ctx, chunks, id, responses); err != nil {
+	if err := upload.rest(ctx, chunks, responses); err != nil {
 		return nil, err
 	}
-	return final(responses), nil
+	return final(responses)
 }
 
 type chunkedUpload struct {
@@ -68,9 +71,10 @@ type chunkedUpload struct {
 	file    *os.File
 	name    string
 	size    int64
+	id      string
 }
 
-func (u chunkedUpload) rest(ctx context.Context, chunks int64, id string, responses []map[string]any) error {
+func (u chunkedUpload) rest(ctx context.Context, chunks int64, responses []map[string]any) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	indexes := make(chan int64)
@@ -78,7 +82,7 @@ func (u chunkedUpload) rest(ctx context.Context, chunks int64, id string, respon
 	for range min(UploadConcurrency, chunks-1) {
 		group.Go(func() {
 			for index := range indexes {
-				response, err := u.send(ctx, index, id)
+				response, err := u.send(ctx, index)
 				if err != nil {
 					cancel(err)
 					continue
@@ -98,7 +102,7 @@ func (u chunkedUpload) rest(ctx context.Context, chunks int64, id string, respon
 	return context.Cause(ctx)
 }
 
-func (u chunkedUpload) send(ctx context.Context, index int64, id string) (map[string]any, error) {
+func (u chunkedUpload) send(ctx context.Context, index int64) (map[string]any, error) {
 	start := index * ChunkSize
 	length := min(ChunkSize, u.size-start)
 	preamble, epilogue, contentType, err := u.multipart()
@@ -108,9 +112,8 @@ func (u chunkedUpload) send(ctx context.Context, index int64, id string) (map[st
 	request := u.session.call(http.MethodPost, "/artifacts")
 	request.headers = request.headers.Clone()
 	request.headers.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, start+length-1, u.size))
-	if id != "" {
-		request.headers.Set("X-Appwrite-Id", id)
-	}
+	request.headers.Set("X-Appwrite-Id", u.id)
+	request.timeout = UploadTimeout
 	request.contentType = contentType
 	request.length = int64(len(preamble)) + length + int64(len(epilogue))
 	request.body = func() io.Reader {
@@ -152,18 +155,13 @@ func quote(name string) string {
 }
 
 // final picks the response that counts every chunk; with concurrent chunks it need not be the last one sent.
-func final(responses []map[string]any) map[string]any {
-	best := responses[len(responses)-1]
-	bestCount := -1.0
+func final(responses []map[string]any) (map[string]any, error) {
 	for _, response := range responses {
 		uploaded, _ := response["chunksUploaded"].(float64)
 		total, _ := response["chunksTotal"].(float64)
-		if total > 0 && uploaded == total {
-			return response
-		}
-		if uploaded > bestCount {
-			best, bestCount = response, uploaded
+		if total > 0 && uploaded == total && int(total) == len(responses) {
+			return response, nil
 		}
 	}
-	return best
+	return nil, fmt.Errorf("distribution: no chunk response reports all %d chunks uploaded", len(responses))
 }

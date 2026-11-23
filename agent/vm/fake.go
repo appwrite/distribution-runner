@@ -11,8 +11,11 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 )
+
+const fakePrefix = "fake-vm-"
 
 type Operation string
 
@@ -23,13 +26,13 @@ const (
 	OperationDestroy Operation = "destroy"
 )
 
-// Call is one recorded Layer call. Args and Env are set for exec, Transfer for copy.
+// Call is one recorded Layer call. Arguments and Environment are set for exec, Transfer for copy.
 type Call struct {
-	Operation Operation
-	Machine   string
-	Args      []string
-	Env       map[string]string
-	Transfer  Transfer
+	Operation   Operation
+	Machine     string
+	Arguments   []string
+	Environment map[string]string
+	Transfer    Transfer
 }
 
 // Fake is a Layer whose machines are temporary directories on the host. Guest paths map under the machine's
@@ -37,9 +40,10 @@ type Call struct {
 // them. It records every call. The zero value is ready to use.
 type Fake struct {
 	// Build stands in for the build script. work is the host directory DISTRIBUTION_WORK names (Home when unset)
-	// and env the command's environment. An *ExitError chooses the exit code; any other error exits 1 with the
-	// message on Stderr. A panic propagates out of Exec.
-	Build func(work string, env map[string]string) error
+	// and environment the command's environment; ctx ends when Exec's does, and Exec waits for Build to return. An
+	// *ExitError chooses the exit code; any other error exits 1 with the message on Stderr. A panic propagates out
+	// of Exec.
+	Build func(ctx context.Context, work string, environment map[string]string) error
 	// Fail, when it returns an error for a call, makes that call fail with it before it acts.
 	Fail func(call Call) error
 	// Directory holds the machine directories, the system temporary directory by default.
@@ -66,7 +70,7 @@ func (f *Fake) Create(_ context.Context, name string) (Machine, error) {
 	if _, exists := f.machines[name]; exists {
 		return Machine{}, fmt.Errorf("%w: %s", ErrExists, name)
 	}
-	root, err := os.MkdirTemp(f.Directory, "fake-vm-"+name+"-")
+	root, err := os.MkdirTemp(f.Directory, fakePrefix+name+"-")
 	if err != nil {
 		return Machine{}, err
 	}
@@ -83,13 +87,13 @@ func (f *Fake) Create(_ context.Context, name string) (Machine, error) {
 }
 
 func (f *Fake) Exec(ctx context.Context, machine Machine, command Command) (int, error) {
-	if err := validateArgs(command.Args); err != nil {
+	if err := validateArguments(command.Arguments); err != nil {
 		return -1, err
 	}
-	if err := validateEnvironment(command.Env); err != nil {
+	if err := validateEnvironment(command.Environment); err != nil {
 		return -1, err
 	}
-	call := Call{Operation: OperationExec, Machine: machine.Name, Args: slices.Clone(command.Args), Env: maps.Clone(command.Env)}
+	call := Call{Operation: OperationExec, Machine: machine.Name, Arguments: slices.Clone(command.Arguments), Environment: maps.Clone(command.Environment)}
 	if err := f.record(call); err != nil {
 		return -1, err
 	}
@@ -104,7 +108,7 @@ func (f *Fake) Exec(ctx context.Context, machine Machine, command Command) (int,
 		return 0, nil
 	}
 	work := machine.Home
-	if value, ok := command.Env["DISTRIBUTION_WORK"]; ok {
+	if value, ok := command.Environment["DISTRIBUTION_WORK"]; ok {
 		work = value
 	}
 	work = host(machine, work)
@@ -121,11 +125,12 @@ func (f *Fake) Exec(ctx context.Context, machine Machine, command Command) (int,
 				done <- result{recovered: recovered, panicked: true}
 			}
 		}()
-		done <- result{err: build(work, maps.Clone(command.Env))}
+		done <- result{err: build(ctx, work, maps.Clone(command.Environment))}
 	}()
 
 	select {
 	case <-ctx.Done():
+		<-done
 		return -1, fmt.Errorf("vm: exec in %s stopped: %w", machine.Name, context.Cause(ctx))
 	case outcome := <-done:
 		if outcome.panicked {
@@ -156,19 +161,83 @@ func (f *Fake) Copy(_ context.Context, machine Machine, transfer Transfer) error
 	if err := f.lookup(machine); err != nil {
 		return err
 	}
-	source, destination := transfer.Source, transfer.Destination
-	if transfer.Direction == In {
-		destination = host(machine, guestPath(machine.Home, destination))
-	} else {
-		source = host(machine, guestPath(machine.Home, source))
+	if transfer.Direction == Out {
+		return copyOut(host(machine, guestPath(machine.Home, transfer.Source)), transfer.Destination, transfer.Limit)
 	}
+	destination := host(machine, guestPath(machine.Home, transfer.Destination))
 	if information, err := os.Stat(destination); err == nil && information.IsDir() {
 		return fmt.Errorf("%w: %s", ErrDestination, transfer.Destination)
 	}
 	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 		return err
 	}
-	return copyTree(source, destination)
+	return copyTree(transfer.Source, destination)
+}
+
+// Sweep removes the machine directories under Directory whose names start with prefix and that this Fake did not
+// create.
+func (f *Fake) Sweep(_ context.Context, prefix string) error {
+	if err := validateName(prefix); err != nil {
+		return err
+	}
+	directory := f.Directory
+	if directory == "" {
+		directory = os.TempDir()
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	f.mutex.Lock()
+	owned := map[string]bool{}
+	for _, root := range f.machines {
+		owned[filepath.Base(root)] = true
+	}
+	f.mutex.Unlock()
+	var failures []error
+	for _, entry := range entries {
+		name, ok := strings.CutPrefix(entry.Name(), fakePrefix)
+		if !ok || !strings.HasPrefix(name, prefix) || owned[entry.Name()] {
+			continue
+		}
+		failures = append(failures, os.RemoveAll(filepath.Join(directory, entry.Name())))
+	}
+	return errors.Join(failures...)
+}
+
+// copyOut copies one regular file of at most limit bytes into a new private file, as Lume does.
+func copyOut(source string, destination string, limit int64) (err error) {
+	information, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if !information.Mode().IsRegular() {
+		return fmt.Errorf("%w: %s", ErrNotFile, source)
+	}
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	output, err := createExclusive(destination)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := output.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			_ = os.Remove(destination)
+		}
+	}()
+	if _, err := io.Copy(&limitWriter{writer: output, limit: limit}, input); err != nil {
+		if errors.Is(err, ErrLimit) {
+			return fmt.Errorf("%w: %s exceeds %d bytes", ErrLimit, source, limit)
+		}
+		return err
+	}
+	return nil
 }
 
 func (f *Fake) Destroy(_ context.Context, machine Machine) error {

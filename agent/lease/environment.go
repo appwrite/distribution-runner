@@ -138,8 +138,8 @@ func identifier(name string) bool {
 	return true
 }
 
-// bundleName accepts bundle identifiers that are safe as a file name: letters, digits, '.', '-' and '_', not
-// starting with '.'.
+// bundleName accepts what Apple allows in a bundle identifier, which is also safe as a file name: letters, digits,
+// '.' and '-', not starting with '.'. build.sh applies the same rule.
 func bundleName(name string) bool {
 	if name == "" || name[0] == '.' {
 		return false
@@ -147,7 +147,7 @@ func bundleName(name string) bool {
 	for _, character := range name {
 		switch {
 		case 'a' <= character && character <= 'z', 'A' <= character && character <= 'Z', '0' <= character && character <= '9':
-		case character == '.', character == '-', character == '_':
+		case character == '.', character == '-':
 		default:
 			return false
 		}

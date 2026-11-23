@@ -146,6 +146,12 @@ func (s *Session) encodeEvents(events []Event) ([][]byte, error) {
 	return encoded, nil
 }
 
+// Check reports whether the event can be sent: its data is valid and it encodes within MaxEventBytes.
+func (s *Session) Check(event Event) error {
+	_, err := s.encodeEvent(event)
+	return err
+}
+
 func (s *Session) encodeEvent(event Event) ([]byte, error) {
 	if err := validate(event); err != nil {
 		return nil, err

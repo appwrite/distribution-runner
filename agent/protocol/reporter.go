@@ -4,28 +4,40 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
-	"net/http"
 	"sync"
 	"time"
 	"unicode/utf8"
 )
 
-// eventOverhead bounds everything in a log event except its lines: id, type, time, stream and punctuation.
-const eventOverhead = 1024
+const (
+	// eventOverhead bounds everything in a log event except its lines: id, type, time, stream and punctuation.
+	eventOverhead = 1024
+	// backlogBytes is how much queued output makes Log wait for a send, pushing back on whoever writes it.
+	backlogBytes = 4 * MaxBatchBytes
+	// LogLimit is the server's default _APP_DISTRIBUTION_LOGS_LIMIT: the bytes of output one lease may report.
+	LogLimit = 50_000_000
+)
 
 // Reporter queues events and log lines and sends them in order: every interval, as soon as a full request is
 // waiting, and on Flush or Close. A batch that fails transiently stays queued and is resent; one the server
-// rejects outright is dropped and its error returned by Close.
+// rejects outright is dropped and its error returned by Close. While more than backlogBytes wait to be sent, Log
+// blocks; past LogLimit bytes of output it reports one truncation line and drops the rest.
 type Reporter struct {
 	session *Session
 	wake    chan struct{}
 	stop    context.CancelFunc
 	done    chan struct{}
+	limit   int64
 
 	sending sync.Mutex
 
 	mutex       sync.Mutex
+	drained     *sync.Cond
+	closed      bool
+	logged      int64
+	truncated   bool
 	pending     []Event
 	pendingSize int
 	tailSize    int
@@ -40,15 +52,32 @@ func NewReporter(session *Session, interval time.Duration) *Reporter {
 		wake:    make(chan struct{}, 1),
 		stop:    stop,
 		done:    make(chan struct{}),
+		limit:   LogLimit,
 	}
+	reporter.drained = sync.NewCond(&reporter.mutex)
 	go reporter.run(ctx, interval)
 	return reporter
 }
 
-// Log queues one line of output, folded into pieces of at most MaxLineBytes.
+// Log queues one line of output, folded into pieces of at most MaxLineBytes. It waits while the backlog is full,
+// until a send drains it or the reporter closes.
 func (r *Reporter) Log(stream string, line string) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
+	for r.pendingSize >= backlogBytes && !r.closed {
+		r.notify()
+		r.drained.Wait()
+	}
+	if r.truncated {
+		return
+	}
+	if r.logged+int64(len(line)) > r.limit {
+		r.truncated = true
+		r.append(StreamStderr, fmt.Sprintf("[distribution] output truncated: the build wrote more than %d bytes", r.limit))
+		r.notify()
+		return
+	}
+	r.logged += int64(len(line))
 	for _, piece := range fold(line) {
 		r.append(stream, piece)
 	}
@@ -83,6 +112,8 @@ func (r *Reporter) Flush(ctx context.Context) error {
 // that cost events.
 func (r *Reporter) Close(ctx context.Context) error {
 	r.mutex.Lock()
+	r.closed = true
+	r.drained.Broadcast()
 	writers := r.writers
 	r.mutex.Unlock()
 	for _, writer := range writers {
@@ -162,6 +193,7 @@ func (r *Reporter) take() []Event {
 	r.pending = nil
 	r.pendingSize = 0
 	r.tailSize = 0
+	r.drained.Broadcast()
 	return events
 }
 
@@ -169,8 +201,22 @@ func (r *Reporter) restore(events []Event) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 	r.pending = append(events, r.pending...)
-	r.pendingSize += len(events) * eventOverhead
+	for _, event := range events {
+		r.pendingSize += weight(event)
+	}
 	r.tailSize = 0
+}
+
+// weight is the share of the backlog an event takes: its overhead plus its escaped lines.
+func weight(event Event) int {
+	size := eventOverhead
+	if data, ok := event.Data.(LogData); ok {
+		for _, line := range data.Lines {
+			encoded, _ := encode(line)
+			size += escapedLength(encoded) + 1
+		}
+	}
+	return size
 }
 
 // send reports events batch by batch and returns the events still to be sent after a transient failure.
@@ -189,7 +235,7 @@ func (r *Reporter) send(ctx context.Context, events []Event) ([]Event, error) {
 	sent := 0
 	for _, batch := range batches(encoded) {
 		err := r.session.sendBatch(ctx, batch)
-		if err != nil && !rejected(err) {
+		if err != nil && !permanent(err) {
 			return kept[sent:], err
 		}
 		if err != nil {
@@ -206,14 +252,9 @@ func (r *Reporter) fail(err error) {
 	r.failure = errors.Join(r.failure, err)
 }
 
-// rejected reports whether the server refused the batch itself, so resending it cannot succeed.
-func rejected(err error) bool {
+func permanent(err error) bool {
 	var response *ResponseError
-	if !errors.As(err, &response) {
-		return false
-	}
-	return response.Status >= 400 && response.Status < 500 &&
-		response.Status != http.StatusTooManyRequests && response.Status != http.StatusRequestTimeout
+	return errors.As(err, &response) && response.Permanent()
 }
 
 // fold cuts a line into pieces of at most MaxLineBytes, moving each cut back to the start of a UTF-8 sequence

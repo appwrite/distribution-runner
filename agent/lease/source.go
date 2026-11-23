@@ -25,6 +25,13 @@ const (
 
 var gzipMagic = []byte{0x1f, 0x8b}
 
+// sizeError is a tarball larger than artifactBytes.
+type sizeError struct{}
+
+func (*sizeError) Error() string {
+	return fmt.Sprintf("the source archive exceeds %d bytes", artifactBytes)
+}
+
 // statusError is a download answered with a status other than 200.
 type statusError struct {
 	status int
@@ -41,13 +48,13 @@ func (e *execution) fetch(ctx context.Context, destination string) error {
 	for attempt := 1; attempt <= sourceAttempts; attempt++ {
 		if attempt > 1 {
 			if err := sleep(ctx, sourceBackoff*time.Duration(attempt-1)); err != nil {
-				return e.failed(ctx, err, "source", protocol.CodeDownloadFailed, sourceArtifact)
+				return e.failed(ctx, err, ReasonSource, protocol.CodeDownloadFailed, sourceArtifact, sourceMessage(err))
 			}
 		}
 		descriptor, err := e.session.Source(ctx)
 		if err == nil && descriptor.Format != sourceFormat {
-			return e.failed(ctx, fmt.Errorf("source format %q is not %q", descriptor.Format, sourceFormat),
-				"source", protocol.CodeArchiveUnknownFormat, sourceArtifact)
+			err = fmt.Errorf("source format %q is not %q", descriptor.Format, sourceFormat)
+			return e.failed(ctx, err, ReasonSource, protocol.CodeArchiveUnknownFormat, sourceArtifact, err.Error())
 		}
 		if err == nil {
 			err = e.download(ctx, descriptor, destination)
@@ -56,11 +63,15 @@ func (e *execution) fetch(ctx context.Context, destination string) error {
 			return nil
 		}
 		if ctx.Err() != nil {
-			return e.failed(ctx, err, "source", protocol.CodeDownloadFailed, sourceArtifact)
+			return e.failed(ctx, err, ReasonSource, protocol.CodeDownloadFailed, sourceArtifact, sourceMessage(err))
 		}
 		var unknown *formatError
 		if errors.As(err, &unknown) {
-			return e.failed(ctx, err, "source", protocol.CodeArchiveUnknownFormat, sourceArtifact)
+			return e.failed(ctx, err, ReasonSource, protocol.CodeArchiveUnknownFormat, sourceArtifact, err.Error())
+		}
+		var large *sizeError
+		if errors.As(err, &large) {
+			return e.failed(ctx, err, ReasonSource, protocol.CodeDownloadFailed, sourceArtifact, err.Error())
 		}
 		e.logger.Warn("source download failed", "attempt", attempt, "error", err)
 		last = err
@@ -70,7 +81,23 @@ func (e *execution) fetch(ctx context.Context, destination string) error {
 	if errors.As(last, &status) {
 		code = protocol.CodeDownloadHTTPError
 	}
-	return e.failed(ctx, last, "source", code, sourceArtifact)
+	return e.failed(ctx, last, ReasonSource, code, sourceArtifact, sourceMessage(last))
+}
+
+// sourceMessage describes a failed download without the host paths a file system error carries.
+func sourceMessage(err error) string {
+	var status *statusError
+	var response *protocol.ResponseError
+	var network *networkError
+	switch {
+	case errors.As(err, &status):
+		return status.Error()
+	case errors.As(err, &response):
+		return "the source descriptor request failed: " + response.Error()
+	case errors.As(err, &network):
+		return network.Error()
+	}
+	return "the source download failed"
 }
 
 type formatError struct{}
@@ -89,7 +116,7 @@ func (e *execution) download(ctx context.Context, descriptor protocol.Source, de
 	for name, value := range descriptor.Headers {
 		request.Header.Set(name, value)
 	}
-	response, err := e.runner.downloader().Do(request)
+	response, err := e.runner.downloader(descriptor.Headers).Do(request)
 	if err != nil {
 		return redact(err)
 	}
@@ -97,18 +124,24 @@ func (e *execution) download(ctx context.Context, descriptor protocol.Source, de
 	if response.StatusCode != http.StatusOK {
 		return &statusError{status: response.StatusCode}
 	}
+	if response.ContentLength > artifactBytes {
+		return &sizeError{}
+	}
 
 	temporary, err := os.CreateTemp(filepath.Dir(destination), ".source-*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(temporary.Name())
-	written, copyErr := io.Copy(temporary, response.Body)
+	written, copyErr := io.Copy(temporary, io.LimitReader(response.Body, artifactBytes+1))
 	if closeErr := temporary.Close(); copyErr == nil {
 		copyErr = closeErr
 	}
 	if copyErr != nil {
 		return redact(copyErr)
+	}
+	if written > artifactBytes {
+		return &sizeError{}
 	}
 	if written < int64(len(gzipMagic)) {
 		return &formatError{}
@@ -133,18 +166,33 @@ func readHeader(path string, header []byte) error {
 	return err
 }
 
+// networkError is a request that failed before the provider answered, with the URL removed.
+type networkError struct {
+	operation string
+	err       error
+}
+
+func (e *networkError) Error() string {
+	return fmt.Sprintf("source download: %s: %v", e.operation, e.err)
+}
+
+func (e *networkError) Unwrap() error {
+	return e.err
+}
+
 // redact drops the URL that net/http and net/url put in their errors; the source URL is a credential.
 func redact(err error) error {
 	var located *url.Error
 	if errors.As(err, &located) {
-		return fmt.Errorf("source download: %s: %w", located.Op, located.Err)
+		return &networkError{operation: located.Op, err: located.Err}
 	}
 	return err
 }
 
-// downloader is the client for the provider's tarball. A redirect must stay on HTTPS (or HTTP when allowed); net/http
-// already drops Authorization and cookie headers when a redirect leaves the original host.
-func (r *Runner) downloader() *http.Client {
+// downloader is the client for the provider's tarball. A redirect must stay on HTTPS (or HTTP when allowed). net/http
+// drops only Authorization, cookie and proxy headers when a redirect leaves the original host and forwards the rest,
+// so every header the descriptor names (a GitLab PRIVATE-TOKEN, say) is removed from a redirect to another host.
+func (r *Runner) downloader(headers map[string]string) *http.Client {
 	client := http.Client{}
 	if r.Download != nil {
 		client = *r.Download
@@ -156,6 +204,11 @@ func (r *Runner) downloader() *http.Client {
 		scheme := request.URL.Scheme
 		if scheme != "https" && (scheme != "http" || !r.AllowHTTP) {
 			return errors.New("redirect leaves https")
+		}
+		if request.URL.Host != via[0].URL.Host {
+			for name := range headers {
+				request.Header.Del(name)
+			}
 		}
 		return nil
 	}

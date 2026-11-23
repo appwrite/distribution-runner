@@ -38,7 +38,6 @@ const (
 	testIdentifier  = "com.example.app"
 	testTeam        = "ABCDE12345"
 	testImage       = "golden-test"
-	testUploadID    = "upload1"
 	leasePath       = "/v1/distribution/runners/" + testRunnerID + "/leases/" + testLeaseID
 	tarballPath     = "/tarball"
 	urlSentinel     = "url-sentinel-7f3a"
@@ -138,7 +137,7 @@ func (s *server) serveUpload(writer http.ResponseWriter, request *http.Request) 
 	uploaded := (end + protocol.ChunkSize) / protocol.ChunkSize
 	s.mutex.Unlock()
 	respond(writer, http.StatusCreated, map[string]any{
-		"$id":            testUploadID,
+		"$id":            request.Header.Get("X-Appwrite-Id"),
 		"chunksUploaded": uploaded,
 		"chunksTotal":    (total + protocol.ChunkSize - 1) / protocol.ChunkSize,
 	})
@@ -297,7 +296,7 @@ type harness struct {
 	logs   *logs
 }
 
-func newHarness(t *testing.T, build func(work string, env map[string]string) error) *harness {
+func newHarness(t *testing.T, build func(_ context.Context, work string, environment map[string]string) error) *harness {
 	t.Helper()
 	fake := newServer(t)
 	client, err := protocol.New(fake.server.URL+"/v1", fake.server.Client(), true)
@@ -306,6 +305,7 @@ func newHarness(t *testing.T, build func(work string, env map[string]string) err
 	}
 	machines := &vm.Fake{Directory: t.TempDir(), Build: build}
 	output := &logs{}
+	scratch := privateDirectory(t)
 	return &harness{
 		server: fake,
 		fake:   machines,
@@ -315,7 +315,7 @@ func newHarness(t *testing.T, build func(work string, env map[string]string) err
 			Credentials: protocol.Credentials{RunnerID: testRunnerID, Token: testRunnerToken},
 			Layer:       machines,
 			Image:       testImage,
-			Directory:   t.TempDir(),
+			Directory:   scratch,
 			Download:    fake.server.Client(),
 			AllowHTTP:   true,
 			Logger:      slog.New(slog.NewTextHandler(output, &slog.HandlerOptions{Level: slog.LevelDebug})),
@@ -323,6 +323,16 @@ func newHarness(t *testing.T, build func(work string, env map[string]string) err
 			Grace:       5 * time.Second,
 		},
 	}
+}
+
+// privateDirectory is a temporary directory only its owner may enter, as Runner.Directory must be.
+func privateDirectory(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return directory
 }
 
 func (h *harness) operations() []vm.Operation {
@@ -379,8 +389,8 @@ func assertFailure(t *testing.T, err error, reason string) *failure {
 }
 
 // padded builds the sample IPA and adds an incompressible resource so the upload needs two chunks.
-func padded(work string) error {
-	if err := Sample(work); err != nil {
+func padded(ctx context.Context, work string) error {
+	if err := Sample(ctx, work); err != nil {
 		return err
 	}
 	name := filepath.Join(work, DirectoryOutput, FileIPA)
@@ -409,19 +419,18 @@ func padded(work string) error {
 	return os.WriteFile(name, buffer.Bytes(), 0o600)
 }
 
-func blocking(t *testing.T) func(string, map[string]string) error {
-	release := make(chan struct{})
-	t.Cleanup(func() { close(release) })
-	return func(string, map[string]string) error {
-		<-release
-		return nil
+// blocking is a build that runs until its context ends.
+func blocking(*testing.T) func(context.Context, string, map[string]string) error {
+	return func(ctx context.Context, _ string, _ map[string]string) error {
+		<-ctx.Done()
+		return ctx.Err()
 	}
 }
 
 func TestRunSuccess(t *testing.T) {
 	var environment []byte
 	var modes = map[string]os.FileMode{}
-	h := newHarness(t, func(work string, _ map[string]string) error {
+	h := newHarness(t, func(ctx context.Context, work string, _ map[string]string) error {
 		var err error
 		environment, err = os.ReadFile(filepath.Join(work, DirectoryInput, FileEnvironment))
 		if err != nil {
@@ -435,7 +444,7 @@ func TestRunSuccess(t *testing.T) {
 			}
 			return nil
 		})
-		return padded(work)
+		return padded(ctx, work)
 	})
 	lease := h.server.lease()
 
@@ -500,8 +509,8 @@ func TestRunSuccess(t *testing.T) {
 	if got := uploads[0].Header.Get("Content-Range"); got != fmt.Sprintf("bytes 0-%d/%d", protocol.ChunkSize-1, total) {
 		t.Errorf("first content-range = %q", got)
 	}
-	if uploads[0].Header.Get("X-Appwrite-Id") != "" || uploads[1].Header.Get("X-Appwrite-Id") != testUploadID {
-		t.Errorf("x-appwrite-id = %q then %q", uploads[0].Header.Get("X-Appwrite-Id"), uploads[1].Header.Get("X-Appwrite-Id"))
+	if id := uploads[0].Header.Get("X-Appwrite-Id"); id == "" || uploads[1].Header.Get("X-Appwrite-Id") != id {
+		t.Errorf("x-appwrite-id = %q then %q, want one minted id on every chunk", id, uploads[1].Header.Get("X-Appwrite-Id"))
 	}
 	for _, request := range h.server.recorded() {
 		if strings.HasPrefix(request.URL, "/v1/") && request.Header.Get("Authorization") != "Bearer "+testLeaseToken {
@@ -517,7 +526,7 @@ func TestRunSuccess(t *testing.T) {
 	if copied := calls[1].Transfer; copied.Direction != vm.In || copied.Destination != "/Users/lume/distribution/input" {
 		t.Errorf("copy in = %+v", copied)
 	}
-	if exec := calls[2]; !slices.Equal(exec.Args, []string{Script}) || len(exec.Env) != 1 || exec.Env[VariableWork] != "/Users/lume/distribution" {
+	if exec := calls[2]; !slices.Equal(exec.Arguments, []string{Script}) || len(exec.Environment) != 1 || exec.Environment[VariableWork] != "/Users/lume/distribution" {
 		t.Errorf("exec = %+v", exec)
 	}
 	h.assertDestroyed(t)
@@ -556,7 +565,7 @@ func TestRunSuccess(t *testing.T) {
 }
 
 func TestRunBuildFailure(t *testing.T) {
-	h := newHarness(t, func(string, map[string]string) error { return &vm.ExitError{Code: 65} })
+	h := newHarness(t, func(context.Context, string, map[string]string) error { return &vm.ExitError{Code: 65} })
 
 	err := h.runner.Run(context.Background(), h.server.lease())
 
@@ -573,7 +582,7 @@ func TestRunBuildFailure(t *testing.T) {
 }
 
 func TestRunVerificationFailure(t *testing.T) {
-	h := newHarness(t, func(work string, _ map[string]string) error { return Sample(work) })
+	h := newHarness(t, func(ctx context.Context, work string, _ map[string]string) error { return Sample(ctx, work) })
 	lease := h.server.lease()
 	lease.Environment[FixtureIdentifier] = "com.example.other"
 
@@ -589,8 +598,14 @@ func TestRunVerificationFailure(t *testing.T) {
 		t.Errorf("result artifact = %+v", artifact)
 	}
 	exit := exitData(t, h.server.find(t, protocol.TypeExit, ""))
-	if exit.ExitCode != ExitFailed || exit.Reason != "verification" || exit.Error == nil {
-		t.Errorf("exit = %+v", exit)
+	if exit.ExitCode != ExitFailed || exit.Reason != "verification" || exit.Error == nil || exit.DurationSeconds <= 0 {
+		t.Errorf("exit = %+v, want the build script's run time", exit)
+	}
+	if types := h.server.types(); !slices.Equal(types[len(types)-2:], []string{protocol.TypeExit, protocol.TypeArtifact}) {
+		t.Errorf("events = %v, want the exit, then the failed artifact", types)
+	}
+	if !strings.Contains(artifact.Error.Message, "com.example.other") {
+		t.Errorf("message %q does not name the mismatch", artifact.Error.Message)
 	}
 	h.assertNoUpload(t)
 	h.assertDestroyed(t)
@@ -636,7 +651,7 @@ func TestRunTimeout(t *testing.T) {
 }
 
 func TestRunPanicDestroysMachine(t *testing.T) {
-	h := newHarness(t, func(string, map[string]string) error { panic("build exploded") })
+	h := newHarness(t, func(context.Context, string, map[string]string) error { panic("build exploded") })
 
 	err := h.runner.Run(context.Background(), h.server.lease())
 
@@ -650,7 +665,7 @@ func TestRunPanicDestroysMachine(t *testing.T) {
 }
 
 func TestRunSourceFailure(t *testing.T) {
-	h := newHarness(t, func(work string, _ map[string]string) error { return Sample(work) })
+	h := newHarness(t, func(ctx context.Context, work string, _ map[string]string) error { return Sample(ctx, work) })
 	h.server.source = func(int) protocol.Source {
 		return protocol.Source{URL: h.server.server.URL + tarballPath, Format: sourceFormat}
 	}
@@ -673,7 +688,7 @@ func TestRunSourceFailure(t *testing.T) {
 }
 
 func TestRunNeverLogsSourceURL(t *testing.T) {
-	h := newHarness(t, func(work string, _ map[string]string) error { return Sample(work) })
+	h := newHarness(t, func(ctx context.Context, work string, _ map[string]string) error { return Sample(ctx, work) })
 	unreachable := httptest.NewServer(http.NotFoundHandler())
 	unreachable.Close()
 	h.server.source = func(count int) protocol.Source {
@@ -711,7 +726,7 @@ func TestRunNeverLogsSourceURL(t *testing.T) {
 func TestRunNeverLeaksSigningSecrets(t *testing.T) {
 	var environment []byte
 	signing := map[string][]byte{}
-	h := newHarness(t, func(work string, _ map[string]string) error {
+	h := newHarness(t, func(ctx context.Context, work string, _ map[string]string) error {
 		input := filepath.Join(work, DirectoryInput)
 		environment, _ = os.ReadFile(filepath.Join(input, FileEnvironment))
 		_ = filepath.WalkDir(filepath.Join(input, DirectorySigning), func(name string, entry os.DirEntry, err error) error {
@@ -720,7 +735,7 @@ func TestRunNeverLeaksSigningSecrets(t *testing.T) {
 			}
 			return nil
 		})
-		return Sample(work)
+		return Sample(ctx, work)
 	})
 	lease := h.server.lease()
 
@@ -747,9 +762,9 @@ func TestRunNeverLeaksSigningSecrets(t *testing.T) {
 	}
 	for index, call := range h.fake.Calls() {
 		recorded, _ := json.Marshal(struct {
-			Args []string
-			Env  map[string]string
-		}{call.Args, call.Env})
+			Arguments   []string
+			Environment map[string]string
+		}{call.Arguments, call.Environment})
 		places["vm call "+strconv.Itoa(index)] = recorded
 	}
 	for place, data := range places {
@@ -771,7 +786,7 @@ func TestRunNeverLeaksSigningSecrets(t *testing.T) {
 }
 
 func TestRunRejectsLeaseWithoutProfile(t *testing.T) {
-	h := newHarness(t, func(work string, _ map[string]string) error { return Sample(work) })
+	h := newHarness(t, func(ctx context.Context, work string, _ map[string]string) error { return Sample(ctx, work) })
 	lease := h.server.lease()
 	lease.Signing.Profiles = protocol.Map[[]byte]{"com.example.other": []byte("profile")}
 
@@ -782,4 +797,237 @@ func TestRunRejectsLeaseWithoutProfile(t *testing.T) {
 		t.Errorf("vm calls for an invalid lease: %v", h.operations())
 	}
 	h.assertNoUpload(t)
+}
+
+func TestRunHidesHostDetailsFromInfrastructureFailures(t *testing.T) {
+	h := newHarness(t, blocking(t))
+	h.fake.Fail = func(call vm.Call) error {
+		if call.Operation == vm.OperationCreate {
+			return errors.New("lume clone: /Users/agent/.lume/golden: No space left on device")
+		}
+		return nil
+	}
+
+	err := h.runner.Run(context.Background(), h.server.lease())
+
+	failed := assertFailure(t, err, ReasonVM)
+	exit := exitData(t, h.server.find(t, protocol.TypeExit, ""))
+	if exit.Error == nil || exit.Error.Message != messageMachine || exit.DurationSeconds != 0 {
+		t.Errorf("exit = %+v, want the generic message and no run time", exit)
+	}
+	if events, _ := json.Marshal(h.server.received()); bytes.Contains(events, []byte("/Users/agent")) {
+		t.Errorf("events carry a host path: %s", events)
+	}
+	if !strings.Contains(h.logs.String(), "No space left on device") || failed.cause == nil {
+		t.Errorf("the cause was not logged:\n%s", h.logs.String())
+	}
+}
+
+func TestRunRefusesAnOversizedResult(t *testing.T) {
+	h := newHarness(t, func(ctx context.Context, work string, _ map[string]string) error {
+		if err := Sample(ctx, work); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(work, DirectoryOutput, FileResult), bytes.Repeat([]byte(" "), resultBytes+1), 0o600)
+	})
+
+	err := h.runner.Run(context.Background(), h.server.lease())
+
+	assertFailure(t, err, ReasonOutput)
+	var artifact protocol.ArtifactData
+	_ = json.Unmarshal(h.server.find(t, protocol.TypeArtifact, resultArtifact).Data, &artifact)
+	if artifact.Error == nil || artifact.Error.Code != protocol.CodeArtifactReadFailed || !strings.Contains(artifact.Error.Message, "output/result.json exceeds") {
+		t.Errorf("result artifact = %+v", artifact.Error)
+	}
+	h.assertNoUpload(t)
+	h.assertDestroyed(t)
+}
+
+func TestRunRefusesAResultTooLargeToReport(t *testing.T) {
+	h := newHarness(t, func(ctx context.Context, work string, _ map[string]string) error {
+		if err := Sample(ctx, work); err != nil {
+			return err
+		}
+		profile, err := os.ReadFile(filepath.Join(work, DirectoryInput, DirectorySigning, DirectoryProfile, testIdentifier+ExtensionProfile))
+		if err != nil {
+			return err
+		}
+		return verify.Sample(filepath.Join(work, DirectoryOutput, FileIPA), verify.Spec{
+			Identifier:   testIdentifier,
+			VersionName:  "1.4.0",
+			VersionCode:  "57",
+			TeamID:       testTeam,
+			Profile:      profile,
+			Entitlements: map[string]any{"padding": strings.Repeat("é", 200_000)},
+		})
+	})
+
+	err := h.runner.Run(context.Background(), h.server.lease())
+
+	assertFailure(t, err, ReasonVerification)
+	var artifact protocol.ArtifactData
+	_ = json.Unmarshal(h.server.find(t, protocol.TypeArtifact, resultArtifact).Data, &artifact)
+	if artifact.Error == nil || !strings.Contains(artifact.Error.Message, "too large to report") {
+		t.Errorf("result artifact = %+v", artifact.Error)
+	}
+	if slices.Contains(h.server.types(), protocol.TypeComplete) {
+		t.Error("a build whose result could not be reported completed")
+	}
+	h.assertNoUpload(t)
+}
+
+func TestRunRefusesAnOversizedSource(t *testing.T) {
+	h := newHarness(t, blocking(t))
+	huge := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Length", strconv.FormatInt(artifactBytes+1, 10))
+		writer.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(huge.Close)
+	h.server.source = func(int) protocol.Source {
+		return protocol.Source{URL: huge.URL + tarballPath, Format: sourceFormat}
+	}
+
+	err := h.runner.Run(context.Background(), h.server.lease())
+
+	assertFailure(t, err, ReasonSource)
+	if h.server.sourceCount() != 1 {
+		t.Errorf("an oversized source was requested %d times, want once", h.server.sourceCount())
+	}
+	h.assertNoUpload(t)
+}
+
+func TestDownloaderStripsDescriptorHeadersOnAnotherHost(t *testing.T) {
+	received := make(chan http.Header, 2)
+	target := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		received <- request.Header.Clone()
+		writer.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(target.Close)
+	origin := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/same" {
+			http.Redirect(writer, request, "/final", http.StatusFound)
+			return
+		}
+		if request.URL.Path == "/final" {
+			received <- request.Header.Clone()
+			return
+		}
+		http.Redirect(writer, request, target.URL+"/final", http.StatusFound)
+	}))
+	t.Cleanup(origin.Close)
+	runner := &Runner{AllowHTTP: true}
+	headers := map[string]string{"Private-Token": headerSentinel}
+
+	for _, test := range []struct {
+		path string
+		kept bool
+	}{{path: "/other", kept: false}, {path: "/same", kept: true}} {
+		request, err := http.NewRequest(http.MethodGet, origin.URL+test.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Private-Token", headerSentinel)
+		response, err := runner.downloader(headers).Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if got := (<-received).Get("Private-Token") == headerSentinel; got != test.kept {
+			t.Errorf("%s: token forwarded %v, want %v", test.path, got, test.kept)
+		}
+	}
+}
+
+func TestRunLosesALeaseWhoseExtensionHangs(t *testing.T) {
+	h := newHarness(t, blocking(t))
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	h.server.extend = func() protocol.Extension {
+		<-release
+		return protocol.Extension{}
+	}
+	lease := h.server.lease()
+	lease.ExpiresAt = time.Now().Add(300 * time.Millisecond)
+	started := time.Now()
+
+	err := h.runner.Run(context.Background(), lease)
+
+	assertFailure(t, err, ReasonLost)
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Errorf("Run took %v after the lease expired", elapsed)
+	}
+	h.assertNoUpload(t)
+	h.assertDestroyed(t)
+}
+
+func TestRunnerSweep(t *testing.T) {
+	h := newHarness(t, blocking(t))
+	stale := filepath.Join(h.runner.Directory, scratchPrefix+"123")
+	kept := filepath.Join(h.runner.Directory, "state.json")
+	machine := filepath.Join(h.fake.Directory, "fake-vm-"+MachinePrefix+"old-1")
+	for _, directory := range []string{stale, machine} {
+		if err := os.MkdirAll(filepath.Join(directory, DirectorySigning), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(kept, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.runner.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+
+	for _, gone := range []string{stale, machine} {
+		if _, err := os.Stat(gone); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s survived the sweep: %v", gone, err)
+		}
+	}
+	if _, err := os.Stat(kept); err != nil {
+		t.Errorf("the sweep removed %s: %v", kept, err)
+	}
+}
+
+func TestRunRefusesAScratchDirectoryOthersCanEnter(t *testing.T) {
+	h := newHarness(t, blocking(t))
+	if err := os.Chmod(h.runner.Directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := h.runner.Run(context.Background(), h.server.lease())
+
+	assertFailure(t, err, ReasonAgent)
+	if len(h.fake.Calls()) != 0 {
+		t.Errorf("vm calls with a shared scratch directory: %v", h.operations())
+	}
+}
+
+func TestSampleStopsWhenTheContextEnds(t *testing.T) {
+	work := t.TempDir()
+	input := filepath.Join(work, DirectoryInput)
+	variables := EncodeEnvironment(map[string]string{VariableIdentifier: testIdentifier, FixtureSleep: "3600"})
+	files := map[string][]byte{
+		FileEnvironment: variables,
+		FileSource:      []byte("source"),
+		filepath.Join(DirectorySigning, FileCertificate):                                   []byte("certificate"),
+		filepath.Join(DirectorySigning, FilePassword):                                      []byte("password"),
+		filepath.Join(DirectorySigning, DirectoryProfile, testIdentifier+ExtensionProfile): []byte("profile"),
+	}
+	for name, data := range files {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(input, name)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(input, name), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	if err := Sample(ctx, work); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Sample = %v, want the deadline", err)
+	}
+	if _, err := os.Stat(filepath.Join(work, DirectoryOutput)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Sample wrote output after its context ended: %v", err)
+	}
 }

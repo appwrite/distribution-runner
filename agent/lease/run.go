@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -48,6 +49,22 @@ const (
 
 	ExitTimeout = 137
 	ExitFailed  = -1
+
+	// MachinePrefix starts the name of every machine a lease runs in.
+	MachinePrefix = "distribution-"
+
+	ReasonBuild        = "build"
+	ReasonTimeout      = "timeout"
+	ReasonCanceled     = "canceled"
+	ReasonLost         = "lost"
+	ReasonStopped      = "stopped"
+	ReasonSource       = "source"
+	ReasonVM           = "vm"
+	ReasonOutput       = "output"
+	ReasonVerification = "verification"
+	ReasonUpload       = "upload"
+	ReasonLease        = "lease"
+	ReasonAgent        = "agent"
 )
 
 const (
@@ -69,6 +86,10 @@ const (
 	messageBytes    = 4096
 	resultBytes     = 5 << 20
 	toolchainBytes  = 1024
+	// artifactBytes is RFC §14's default _APP_DISTRIBUTION_SIZE_LIMIT, the largest IPA the server accepts. It also
+	// bounds the source tarball, since both land on the host disk the VMs share.
+	artifactBytes = 4_000_000_000
+	scratchPrefix = "lease-"
 )
 
 var (
@@ -95,7 +116,8 @@ type Runner struct {
 	Grace    time.Duration
 }
 
-// failure is a run that ended without a build: it becomes an optional failed artifact event and a non-zero exit.
+// failure is a run that ended without a build: it becomes a non-zero exit and an optional failed artifact event.
+// message is what the customer sees; cause, which can carry host details, is only logged.
 type failure struct {
 	exit     int
 	reason   string
@@ -112,6 +134,13 @@ func (f *failure) Error() string {
 
 func (f *failure) Unwrap() error {
 	return f.cause
+}
+
+// Infrastructure reports whether a Run error lies with the host, the VM layer or the agent, rather than with the
+// build, the lease or the server; a host that keeps failing this way would fail every lease it claims.
+func Infrastructure(err error) bool {
+	var failed *failure
+	return errors.As(err, &failed) && (failed.reason == ReasonVM || failed.reason == ReasonAgent)
 }
 
 type execution struct {
@@ -182,10 +211,10 @@ func (r *Runner) Run(ctx context.Context, lease protocol.Lease) error {
 	if err != nil {
 		var failed *failure
 		if !errors.As(err, &failed) {
-			failed = &failure{exit: ExitFailed, reason: "agent", code: protocol.CodeJobFailed, message: err.Error(), cause: err}
+			failed = &failure{exit: ExitFailed, reason: ReasonAgent, code: protocol.CodeJobFailed, message: messageAgent, cause: err}
 		}
 		execution.report(failed)
-		logger.Warn("lease failed", "reason", failed.reason, "exitCode", failed.exit, "error", failed.message)
+		logger.Warn("lease failed", "reason", failed.reason, "exitCode", failed.exit, "error", failed.message, "cause", failed.cause)
 		return failed
 	}
 	execution.succeed(outcome)
@@ -204,29 +233,29 @@ func (e *execution) run(ctx context.Context) (done outcome, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			e.logger.Error("lease run panicked", "panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
-			err = &failure{exit: ExitFailed, reason: "agent", code: protocol.CodeJobFailed, message: "the agent failed unexpectedly"}
+			err = &failure{exit: ExitFailed, reason: ReasonAgent, code: protocol.CodeJobFailed, message: messageAgent, cause: fmt.Errorf("panic: %v", recovered)}
 		}
 	}()
 
 	expected, err := e.expected()
 	if err != nil {
-		return outcome{}, &failure{exit: ExitFailed, reason: "lease", code: protocol.CodeJobFailed, message: err.Error(), cause: err}
+		return outcome{}, &failure{exit: ExitFailed, reason: ReasonLease, code: protocol.CodeJobFailed, message: err.Error(), cause: err}
 	}
 	variables, err := Environment(e.lease)
 	if err != nil {
-		return outcome{}, &failure{exit: ExitFailed, reason: "lease", code: protocol.CodeJobFailed, message: err.Error(), cause: err}
+		return outcome{}, &failure{exit: ExitFailed, reason: ReasonLease, code: protocol.CodeJobFailed, message: err.Error(), cause: err}
 	}
 
 	scratch, err := e.runner.scratch()
 	if err != nil {
-		return outcome{}, e.failed(ctx, err, "agent", protocol.CodeJobFailed, "")
+		return outcome{}, e.failed(ctx, err, ReasonAgent, protocol.CodeJobFailed, "", messageAgent)
 	}
 	defer os.RemoveAll(scratch)
 	input := filepath.Join(scratch, DirectoryInput)
 
 	e.stage(StageSource)
 	if err := writeInput(input, e.lease, variables); err != nil {
-		return outcome{}, e.failed(ctx, err, "agent", protocol.CodeJobFailed, "")
+		return outcome{}, e.failed(ctx, err, ReasonAgent, protocol.CodeJobFailed, "", messageAgent)
 	}
 	if err := e.fetch(ctx, filepath.Join(input, FileSource)); err != nil {
 		return outcome{}, err
@@ -236,7 +265,7 @@ func (e *execution) run(ctx context.Context) (done outcome, err error) {
 	machine, err := e.runner.Layer.Create(ctx, machineName(e.lease))
 	defer e.destroy(ctx, machine)
 	if err != nil {
-		return outcome{}, e.failed(ctx, err, "vm", protocol.CodeJobFailed, "")
+		return outcome{}, e.failed(ctx, err, ReasonVM, protocol.CodeJobFailed, "", messageMachine)
 	}
 	work := path.Join(machine.Home, Work)
 	err = e.runner.Layer.Copy(ctx, machine, vm.Transfer{Direction: vm.In, Source: input, Destination: path.Join(work, DirectoryInput)})
@@ -244,7 +273,7 @@ func (e *execution) run(ctx context.Context) (done outcome, err error) {
 		e.logger.Warn("removing the host copy of the lease input failed", "error", removeErr)
 	}
 	if err != nil {
-		return outcome{}, e.failed(ctx, err, "vm", protocol.CodeJobFailed, "")
+		return outcome{}, e.failed(ctx, err, ReasonVM, protocol.CodeJobFailed, "", messageMachine)
 	}
 
 	if err := e.build(ctx, machine, work); err != nil {
@@ -261,7 +290,7 @@ func (e *execution) run(ctx context.Context) (done outcome, err error) {
 
 	started = time.Now()
 	if _, err := e.session.Upload(ctx, filepath.Join(output, FileIPA)); err != nil {
-		return outcome{}, e.failed(ctx, err, "upload", protocol.CodeUploadFailed, outputArtifact)
+		return outcome{}, e.failed(ctx, err, ReasonUpload, protocol.CodeUploadFailed, outputArtifact, uploadMessage(err))
 	}
 	return outcome{content: content, verify: verified, upload: time.Since(started)}, nil
 }
@@ -271,21 +300,21 @@ func (e *execution) build(ctx context.Context, machine vm.Machine, work string) 
 	stderr := &lines{writer: e.reporter.Writer(protocol.StreamStderr)}
 	started := time.Now()
 	code, err := e.runner.Layer.Exec(ctx, machine, vm.Command{
-		Args:   []string{Script},
-		Env:    map[string]string{VariableWork: work},
-		Stdout: stdout,
-		Stderr: stderr,
+		Arguments:   []string{Script},
+		Environment: map[string]string{VariableWork: work},
+		Stdout:      stdout,
+		Stderr:      stderr,
 	})
 	e.elapsed = time.Since(started)
 	stdout.finish()
 	stderr.finish()
 	if err != nil {
-		return e.failed(ctx, err, "vm", protocol.CodeJobFailed, "")
+		return e.failed(ctx, err, ReasonVM, protocol.CodeJobFailed, "", messageMachine)
 	}
 	if code != 0 {
 		return &failure{
 			exit:    code,
-			reason:  "build",
+			reason:  ReasonBuild,
 			code:    protocol.CodeJobExitNonzero,
 			message: fmt.Sprintf("the build script exited with status %d", code),
 		}
@@ -293,29 +322,39 @@ func (e *execution) build(ctx context.Context, machine vm.Machine, work string) 
 	return nil
 }
 
-// collect copies the IPA and result.json out of the VM and verifies the IPA against the lease. Only the toolchain is
-// taken from the VM's result.json; every identity field comes from the verified IPA.
+// collect copies the IPA and result.json out of the VM, each a regular file under its size limit, and verifies the
+// IPA against the lease. Only the toolchain is taken from the VM's result.json; every identity field comes from the
+// verified IPA, and the result must fit in the event that reports it.
 func (e *execution) collect(ctx context.Context, machine vm.Machine, work string, output string, expected verify.Expected) (result, error) {
-	for _, name := range []string{FileIPA, FileResult} {
+	for _, copied := range []struct {
+		name  string
+		limit int64
+	}{{FileIPA, artifactBytes}, {FileResult, resultBytes}} {
 		err := e.runner.Layer.Copy(ctx, machine, vm.Transfer{
 			Direction:   vm.Out,
-			Source:      path.Join(work, DirectoryOutput, name),
-			Destination: filepath.Join(output, name),
+			Source:      path.Join(work, DirectoryOutput, copied.name),
+			Destination: filepath.Join(output, copied.name),
+			Limit:       copied.limit,
 		})
 		if err != nil {
-			return result{}, e.failed(ctx, fmt.Errorf("copy output/%s: %w", name, err), "output", protocol.CodeArtifactNotFound, resultArtifact)
+			code, message := copyFailure(copied.name, copied.limit, err)
+			return result{}, e.failed(ctx, err, ReasonOutput, code, resultArtifact, message)
 		}
 	}
 	reported, err := readToolchain(filepath.Join(output, FileResult))
 	if err != nil {
-		return result{}, e.failed(ctx, err, "output", protocol.CodeArtifactJSONInvalid, resultArtifact)
+		return result{}, e.failed(ctx, err, ReasonOutput, protocol.CodeArtifactJSONInvalid, resultArtifact, err.Error())
 	}
-	verified, err := verify.IPA(filepath.Join(output, FileIPA), expected)
+	verified, err := verify.IPA(filepath.Join(output, FileIPA), expected, output)
 	if err != nil {
-		return result{}, e.failed(ctx, err, "verification", protocol.CodeArtifactFailed, resultArtifact)
+		message := "the ipa could not be read for verification"
+		if verify.Rejected(err) {
+			message = err.Error()
+		}
+		return result{}, e.failed(ctx, err, ReasonVerification, protocol.CodeArtifactFailed, resultArtifact, message)
 	}
 	reported.Image = e.runner.Image
-	return result{
+	content := result{
 		Artifact:     FileIPA,
 		Type:         "ipa",
 		Digest:       verified.Digest,
@@ -328,7 +367,24 @@ func (e *execution) collect(ctx context.Context, machine vm.Machine, work string
 		Signed:       verified.Signed,
 		Entitlements: verified.Entitlements,
 		Toolchain:    reported,
-	}, nil
+	}
+	if err := e.session.Check(resultEvent(content, 0)); err != nil {
+		return result{}, e.failed(ctx, err, ReasonVerification, protocol.CodeArtifactFailed, resultArtifact,
+			"the verified result is too large to report: "+err.Error())
+	}
+	return content, nil
+}
+
+// copyFailure is the code and customer message for an output file that could not be copied out.
+func copyFailure(name string, limit int64, err error) (protocol.Code, string) {
+	output := DirectoryOutput + "/" + name
+	switch {
+	case errors.Is(err, vm.ErrLimit):
+		return protocol.CodeArtifactReadFailed, fmt.Sprintf("%s exceeds %d bytes", output, limit)
+	case errors.Is(err, vm.ErrNotFile), errors.Is(err, os.ErrNotExist):
+		return protocol.CodeArtifactNotFound, output + " is missing or not a regular file"
+	}
+	return protocol.CodeArtifactReadFailed, output + " could not be copied out of the build machine"
 }
 
 // expected checks the lease carries what verification needs, the identifier cross-checked against the profile keys.
@@ -362,8 +418,9 @@ func (e *execution) expected() (verify.Expected, error) {
 	}, nil
 }
 
-// failed turns a step's error into a failure, unless the run was stopped, in which case the stop is the failure.
-func (e *execution) failed(ctx context.Context, err error, reason string, code protocol.Code, artifact string) error {
+// failed turns a step's error into a failure carrying message, unless the run was stopped, in which case the stop is
+// the failure.
+func (e *execution) failed(ctx context.Context, err error, reason string, code protocol.Code, artifact string, message string) error {
 	if stopped := stopped(ctx); stopped != nil {
 		stopped.cause = err
 		return stopped
@@ -377,7 +434,20 @@ func (e *execution) failed(ctx context.Context, err error, reason string, code p
 	case outputArtifact:
 		kind = artifactUpload
 	}
-	return &failure{exit: ExitFailed, reason: reason, code: code, message: err.Error(), artifact: artifact, kind: kind, cause: err}
+	return &failure{exit: ExitFailed, reason: reason, code: code, message: message, artifact: artifact, kind: kind, cause: err}
+}
+
+const (
+	messageAgent   = "the agent failed"
+	messageMachine = "the build machine failed"
+)
+
+func uploadMessage(err error) string {
+	var response *protocol.ResponseError
+	if errors.As(err, &response) {
+		return "the upload failed: " + response.Error()
+	}
+	return "the upload failed"
 }
 
 func stopped(ctx context.Context) *failure {
@@ -387,17 +457,26 @@ func stopped(ctx context.Context) *failure {
 	cause := context.Cause(ctx)
 	switch {
 	case errors.Is(cause, errTimeout):
-		return &failure{exit: ExitTimeout, reason: "timeout", code: protocol.CodeJobFailed, message: "the build exceeded the lease timeout"}
+		return &failure{exit: ExitTimeout, reason: ReasonTimeout, code: protocol.CodeJobFailed, message: "the build exceeded the lease timeout"}
 	case errors.Is(cause, errCanceled):
-		return &failure{exit: ExitFailed, reason: "canceled", code: protocol.CodeJobFailed, message: "the lease was canceled"}
+		return &failure{exit: ExitFailed, reason: ReasonCanceled, code: protocol.CodeJobFailed, message: "the lease was canceled"}
 	case errors.Is(cause, errLost):
-		return &failure{exit: ExitFailed, reason: "lost", code: protocol.CodeJobFailed, message: "the lease could not be extended before it expired"}
+		return &failure{exit: ExitFailed, reason: ReasonLost, code: protocol.CodeJobFailed, message: "the lease could not be extended before it expired"}
 	}
-	return &failure{exit: ExitFailed, reason: "stopped", code: protocol.CodeJobFailed, message: "the agent stopped the build"}
+	return &failure{exit: ExitFailed, reason: ReasonStopped, code: protocol.CodeJobFailed, message: "the agent stopped the build"}
 }
 
+// report sends the exit, as success does, then the failed artifact. durationSeconds is the build script's run time
+// whenever it ran, and 0 when the run failed before it.
 func (e *execution) report(failed *failure) {
 	reported := protocol.Failure{Code: failed.code, Message: truncate(failed.message, messageBytes)}
+	e.reporter.Emit(protocol.Event{Type: protocol.TypeExit, Data: protocol.ExitData{
+		ExitCode:        failed.exit,
+		Reason:          failed.reason,
+		Image:           e.runner.Image,
+		DurationSeconds: e.elapsed.Seconds(),
+		Error:           &reported,
+	}})
 	if failed.artifact != "" {
 		e.reporter.Emit(protocol.Event{Type: protocol.TypeArtifact, Data: protocol.ArtifactData{
 			ArtifactID:   failed.artifact,
@@ -406,35 +485,16 @@ func (e *execution) report(failed *failure) {
 			Error:        &reported,
 		}})
 	}
-	duration := 0.0
-	if failed.exit != ExitFailed {
-		duration = e.elapsed.Seconds()
-	}
-	e.reporter.Emit(protocol.Event{Type: protocol.TypeExit, Data: protocol.ExitData{
-		ExitCode:        failed.exit,
-		Reason:          failed.reason,
-		Image:           e.runner.Image,
-		DurationSeconds: duration,
-		Error:           &reported,
-	}})
 }
 
 func (e *execution) succeed(done outcome) {
-	verified := done.verify.Seconds()
 	uploaded := done.upload.Seconds()
 	e.reporter.Emit(protocol.Event{Type: protocol.TypeExit, Data: protocol.ExitData{
 		ExitCode:        0,
 		Image:           e.runner.Image,
 		DurationSeconds: e.elapsed.Seconds(),
 	}})
-	e.reporter.Emit(protocol.Event{Type: protocol.TypeArtifact, Data: protocol.ArtifactData{
-		ArtifactID:      resultArtifact,
-		ArtifactType:    artifactRead,
-		Status:          protocol.ArtifactSuccess,
-		Content:         done.content,
-		Format:          formatJSON,
-		DurationSeconds: &verified,
-	}})
+	e.reporter.Emit(resultEvent(done.content, done.verify))
 	e.reporter.Emit(protocol.Event{Type: protocol.TypeArtifact, Data: protocol.ArtifactData{
 		ArtifactID:      outputArtifact,
 		ArtifactType:    artifactUpload,
@@ -442,6 +502,18 @@ func (e *execution) succeed(done outcome) {
 		DurationSeconds: &uploaded,
 	}})
 	e.reporter.Emit(protocol.Event{Type: protocol.TypeComplete})
+}
+
+func resultEvent(content result, verification time.Duration) protocol.Event {
+	seconds := verification.Seconds()
+	return protocol.Event{Type: protocol.TypeArtifact, Data: protocol.ArtifactData{
+		ArtifactID:      resultArtifact,
+		ArtifactType:    artifactRead,
+		Status:          protocol.ArtifactSuccess,
+		Content:         content,
+		Format:          formatJSON,
+		DurationSeconds: &seconds,
+	}}
 }
 
 func (e *execution) stage(stage string) {
@@ -458,13 +530,15 @@ func (e *execution) destroy(ctx context.Context, machine vm.Machine) {
 }
 
 // extend renews the lease every third of its remaining time. It cancels the run when the server cancels the lease,
-// refuses the renewal, or the lease expires before a renewal succeeds.
+// refuses the renewal, or the lease expires before a renewal succeeds; no renewal outlives the lease it renews.
 func (e *execution) extend(ctx context.Context, cancel context.CancelCauseFunc, expiresAt time.Time) {
 	for {
 		if sleep(ctx, max(time.Until(expiresAt)/3, minimumExtend)) != nil {
 			return
 		}
-		extension, err := e.session.Extend(ctx)
+		renewing, stop := context.WithDeadline(ctx, expiresAt)
+		extension, err := e.session.Extend(renewing)
+		stop()
 		switch {
 		case ctx.Err() != nil:
 			return
@@ -474,7 +548,7 @@ func (e *execution) extend(ctx context.Context, cancel context.CancelCauseFunc, 
 			return
 		case err == nil:
 			expiresAt = deadline(extension.ExpiresAt)
-		case refused(err), !time.Now().Before(expiresAt):
+		case permanent(err), !time.Now().Before(expiresAt):
 			e.logger.Warn("lease lost", "error", err)
 			cancel(errLost)
 			return
@@ -492,13 +566,9 @@ func deadline(expiresAt time.Time) time.Time {
 	return expiresAt
 }
 
-func refused(err error) bool {
+func permanent(err error) bool {
 	var response *protocol.ResponseError
-	if !errors.As(err, &response) {
-		return false
-	}
-	return response.Status >= 400 && response.Status < 500 &&
-		response.Status != http.StatusTooManyRequests && response.Status != http.StatusRequestTimeout
+	return errors.As(err, &response) && response.Permanent()
 }
 
 func writeInput(input string, lease protocol.Lease, variables map[string]string) error {
@@ -522,15 +592,16 @@ func writeInput(input string, lease protocol.Lease, variables map[string]string)
 	return nil
 }
 
+// readToolchain reads the toolchain versions from result.json. Its errors describe the file, never the host.
 func readToolchain(name string) (toolchain, error) {
 	file, err := os.Open(name)
 	if err != nil {
-		return toolchain{}, err
+		return toolchain{}, fmt.Errorf("%s could not be read", FileResult)
 	}
 	defer file.Close()
 	data, err := io.ReadAll(io.LimitReader(file, resultBytes+1))
 	if err != nil {
-		return toolchain{}, err
+		return toolchain{}, fmt.Errorf("%s could not be read", FileResult)
 	}
 	if len(data) > resultBytes {
 		return toolchain{}, fmt.Errorf("%s exceeds %d bytes", FileResult, resultBytes)
@@ -570,7 +641,7 @@ func truncate(text string, limit int) string {
 
 func machineName(lease protocol.Lease) string {
 	var builder strings.Builder
-	builder.WriteString("distribution-")
+	builder.WriteString(MachinePrefix)
 	for _, character := range lease.LeaseID {
 		switch {
 		case 'a' <= character && character <= 'z', 'A' <= character && character <= 'Z', '0' <= character && character <= '9':
@@ -602,8 +673,49 @@ func (r *Runner) scratch() (string, error) {
 		if err := os.MkdirAll(r.Directory, 0o700); err != nil {
 			return "", err
 		}
+		if err := private(r.Directory); err != nil {
+			return "", err
+		}
 	}
-	return os.MkdirTemp(r.Directory, "lease-")
+	return os.MkdirTemp(r.Directory, scratchPrefix)
+}
+
+// private refuses a directory that is a symlink, that another user owns, or that anyone else may enter.
+func private(directory string) error {
+	information, err := os.Lstat(directory)
+	if err != nil {
+		return err
+	}
+	if !information.IsDir() {
+		return fmt.Errorf("lease: %s is not a directory", directory)
+	}
+	if information.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("lease: %s must not be accessible to other users (mode %v)", directory, information.Mode().Perm())
+	}
+	if status, ok := information.Sys().(*syscall.Stat_t); ok && int(status.Uid) != os.Getuid() {
+		return fmt.Errorf("lease: %s belongs to user %d, not the agent", directory, status.Uid)
+	}
+	return nil
+}
+
+// Sweep removes what an earlier agent process left behind when it crashed or was killed: lease scratch directories
+// under Directory, which can hold signing material, and every machine named for a lease. Run it before the first
+// lease, never while a lease runs.
+func (r *Runner) Sweep(ctx context.Context) error {
+	var failures []error
+	if r.Directory != "" {
+		entries, err := os.ReadDir(r.Directory)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			failures = append(failures, err)
+		}
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), scratchPrefix) {
+				failures = append(failures, os.RemoveAll(filepath.Join(r.Directory, entry.Name())))
+			}
+		}
+	}
+	failures = append(failures, r.Layer.Sweep(ctx, MachinePrefix))
+	return errors.Join(failures...)
 }
 
 func (r *Runner) logger() *slog.Logger {

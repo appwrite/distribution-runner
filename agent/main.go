@@ -11,12 +11,15 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,13 +34,23 @@ const (
 	backendLume = "lume"
 	backendFake = "fake"
 	fakeImage   = "fake"
+	// fakeLabel is added to a fake runner's labels, so only leases that ask for it, drills, land on it.
+	fakeLabel = "fake"
 
+	secretVariable    = "DISTRIBUTION_AGENT_SECRET"
 	maximumCapacity   = 2
 	heartbeatInterval = 30 * time.Second
 	requestTimeout    = 30 * time.Second
 	claimInterval     = 2 * time.Second
 	claimCeiling      = 30 * time.Second
 	stateMode         = 0o600
+	// failureLimit is how many leases in a row may fail on the host before the agent stops claiming.
+	failureLimit = 3
+)
+
+var (
+	errRevoked   = errors.New("the server refused the runner token: remove the state file and enrol again")
+	errUnhealthy = fmt.Errorf("%d leases in a row failed on this host: draining until the host is fixed and the agent restarted", failureLimit)
 )
 
 type config struct {
@@ -50,7 +63,6 @@ type config struct {
 	backend    string
 	golden     string
 	key        string
-	knownHosts string
 	user       string
 	lume       string
 	directory  string
@@ -60,7 +72,18 @@ type config struct {
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
-	if err := run(os.Args[1:], os.Getenv, logger); err != nil {
+	secret := os.Getenv(secretVariable)
+	if err := os.Unsetenv(secretVariable); err != nil {
+		logger.Error("agent stopped", "error", err)
+		os.Exit(1)
+	}
+	lookup := func(name string) string {
+		if name == secretVariable {
+			return secret
+		}
+		return os.Getenv(name)
+	}
+	if err := run(os.Args[1:], lookup, logger); err != nil {
 		logger.Error("agent stopped", "error", err)
 		os.Exit(1)
 	}
@@ -107,13 +130,19 @@ func run(arguments []string, lookup func(string) string, logger *slog.Logger) er
 			Logger:      logger,
 		},
 	}
+	if err := agent.runner.Sweep(drain); err != nil {
+		logger.Warn("removing what an earlier run left behind failed", "error", err)
+	}
 	logger.Info("agent started", "version", version, "runner", credentials, "capacity", settings.capacity, "vm", settings.backend)
-	agent.serve(drain, work)
+	if err := agent.serve(drain, work); err != nil {
+		return err
+	}
 	logger.Info("agent drained")
 	return nil
 }
 
-// watchSignals drains on the first SIGTERM or SIGINT and stops the builds in flight on the second.
+// watchSignals drains on the first SIGTERM or SIGINT and stops the builds in flight on the second. A third signal
+// gets the default behaviour and ends the process.
 func watchSignals(logger *slog.Logger, drain context.CancelFunc, stop context.CancelFunc) {
 	signals := make(chan os.Signal, 2)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
@@ -121,6 +150,7 @@ func watchSignals(logger *slog.Logger, drain context.CancelFunc, stop context.Ca
 	logger.Info("draining: finishing the leases in flight")
 	drain()
 	<-signals
+	signal.Stop(signals)
 	logger.Warn("stopping the leases in flight")
 	stop()
 }
@@ -137,15 +167,14 @@ func parse(arguments []string, lookup func(string) string, output io.Writer) (co
 	var settings config
 	var labels, capacity, allowHTTP string
 	flags.StringVar(&settings.endpoint, "endpoint", setting("DISTRIBUTION_AGENT_ENDPOINT", ""), "Appwrite endpoint including /v1 (DISTRIBUTION_AGENT_ENDPOINT)")
-	flags.StringVar(&settings.secretFile, "secret-file", setting("DISTRIBUTION_AGENT_SECRET_FILE", ""), "file holding the enrolment secret; DISTRIBUTION_AGENT_SECRET also works (DISTRIBUTION_AGENT_SECRET_FILE)")
+	flags.StringVar(&settings.secretFile, "secret-file", setting("DISTRIBUTION_AGENT_SECRET_FILE", ""), "file holding the enrolment secret; "+secretVariable+" also works (DISTRIBUTION_AGENT_SECRET_FILE)")
 	flags.StringVar(&settings.state, "state", setting("DISTRIBUTION_AGENT_STATE", defaultState()), "file holding the runner credentials, mode 0600 (DISTRIBUTION_AGENT_STATE)")
 	flags.StringVar(&settings.name, "name", setting("DISTRIBUTION_AGENT_NAME", hostname()), "runner name (DISTRIBUTION_AGENT_NAME)")
 	flags.StringVar(&labels, "labels", setting("DISTRIBUTION_AGENT_LABELS", ""), "comma-separated labels, such as xcode-27.2 (DISTRIBUTION_AGENT_LABELS)")
-	flags.StringVar(&capacity, "capacity", setting("DISTRIBUTION_AGENT_CAPACITY", "1"), "concurrent leases, 1 or 2 (DISTRIBUTION_AGENT_CAPACITY)")
-	flags.StringVar(&settings.backend, "vm", setting("DISTRIBUTION_AGENT_VM", backendLume), "vm backend, lume or fake (DISTRIBUTION_AGENT_VM)")
+	flags.StringVar(&capacity, "capacity", setting("DISTRIBUTION_AGENT_CAPACITY", "1"), "concurrent leases, 1 or 2; lume runs 1 until spike S7 proves guest isolation (DISTRIBUTION_AGENT_CAPACITY)")
+	flags.StringVar(&settings.backend, "vm", setting("DISTRIBUTION_AGENT_VM", backendLume), "vm backend, lume, or fake for local drills with allow-http (DISTRIBUTION_AGENT_VM)")
 	flags.StringVar(&settings.golden, "golden", setting("DISTRIBUTION_AGENT_GOLDEN", ""), "golden lume image every build is cloned from (DISTRIBUTION_AGENT_GOLDEN)")
 	flags.StringVar(&settings.key, "ssh-key", setting("DISTRIBUTION_AGENT_SSH_KEY", ""), "private key the guest account authorises (DISTRIBUTION_AGENT_SSH_KEY)")
-	flags.StringVar(&settings.knownHosts, "known-hosts", setting("DISTRIBUTION_AGENT_KNOWN_HOSTS", ""), "known_hosts file pinning the golden image's host key (DISTRIBUTION_AGENT_KNOWN_HOSTS)")
 	flags.StringVar(&settings.user, "ssh-user", setting("DISTRIBUTION_AGENT_SSH_USER", ""), "guest account, lume by default (DISTRIBUTION_AGENT_SSH_USER)")
 	flags.StringVar(&settings.lume, "lume", setting("DISTRIBUTION_AGENT_LUME", ""), "lume executable, lume from PATH by default (DISTRIBUTION_AGENT_LUME)")
 	flags.StringVar(&settings.directory, "directory", setting("DISTRIBUTION_AGENT_DIRECTORY", filepath.Join(os.TempDir(), "distribution-agent")), "host scratch directory (DISTRIBUTION_AGENT_DIRECTORY)")
@@ -184,6 +213,13 @@ func parse(arguments []string, lookup func(string) string, output io.Writer) (co
 		return config{}, fmt.Errorf("vm must be %s or %s", backendLume, backendFake)
 	case settings.backend == backendLume && (settings.golden == "" || settings.key == ""):
 		return config{}, errors.New("the lume backend needs golden and ssh-key")
+	case settings.backend == backendLume && settings.capacity > 1:
+		return config{}, errors.New("the lume backend runs one lease per host until spike S7 proves that concurrent guests cannot reach each other (vm/README.md, host setup)")
+	case settings.backend == backendFake && !settings.allowHTTP:
+		return config{}, errors.New("the fake vm backend is for local drills only: it needs allow-http")
+	}
+	if settings.backend == backendFake && !slices.Contains(settings.labels, fakeLabel) {
+		settings.labels = append(settings.labels, fakeLabel)
 	}
 	return settings, nil
 }
@@ -192,18 +228,17 @@ func backend(settings config) (vm.Layer, string) {
 	if settings.backend == backendFake {
 		return &vm.Fake{
 			Directory: settings.directory,
-			Build: func(work string, _ map[string]string) error {
-				return lease.Sample(work)
+			Build: func(ctx context.Context, work string, _ map[string]string) error {
+				return lease.Sample(ctx, work)
 			},
 		}, fakeImage
 	}
 	return &vm.Lume{
-		Golden:     settings.golden,
-		Binary:     settings.lume,
-		User:       settings.user,
-		Key:        settings.key,
-		KnownHosts: settings.knownHosts,
-		Directory:  settings.directory,
+		Golden:    settings.golden,
+		Binary:    settings.lume,
+		User:      settings.user,
+		Key:       settings.key,
+		Directory: settings.directory,
 	}, settings.golden
 }
 
@@ -247,20 +282,27 @@ func enrolmentSecret(file string, lookup func(string) string) (string, error) {
 		}
 		return strings.TrimSpace(string(data)), nil
 	}
-	if secret := lookup("DISTRIBUTION_AGENT_SECRET"); secret != "" {
+	if secret := lookup(secretVariable); secret != "" {
 		return secret, nil
 	}
-	return "", errors.New("not enrolled: set DISTRIBUTION_AGENT_SECRET or secret-file")
+	return "", errors.New("not enrolled: set " + secretVariable + " or secret-file")
 }
 
-// loadCredentials refuses a state file that other users can read, since it holds the runner token.
+// loadCredentials refuses a state file that is a symlink, that another user owns or that other users can read, since
+// it holds the runner token.
 func loadCredentials(path string) (protocol.Credentials, error) {
-	information, err := os.Stat(path)
+	information, err := os.Lstat(path)
 	if err != nil {
 		return protocol.Credentials{}, err
 	}
+	if !information.Mode().IsRegular() {
+		return protocol.Credentials{}, fmt.Errorf("state file %s is not a regular file", path)
+	}
 	if information.Mode().Perm()&0o077 != 0 {
 		return protocol.Credentials{}, fmt.Errorf("state file %s must not be readable by other users (mode %v)", path, information.Mode().Perm())
+	}
+	if status, ok := information.Sys().(*syscall.Stat_t); ok && int(status.Uid) != os.Getuid() {
+		return protocol.Credentials{}, fmt.Errorf("state file %s belongs to user %d, not the agent", path, status.Uid)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -303,7 +345,20 @@ func saveCredentials(path string, credentials protocol.Credentials) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	return os.Rename(temporary.Name(), path)
+	if err := os.Rename(temporary.Name(), path); err != nil {
+		return err
+	}
+	return syncDirectory(directory)
+}
+
+// syncDirectory makes a rename in directory durable.
+func syncDirectory(directory string) error {
+	handle, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	defer handle.Close()
+	return handle.Sync()
 }
 
 type agent struct {
@@ -313,23 +368,38 @@ type agent struct {
 	labels      []string
 	capacity    int
 	logger      *slog.Logger
+
+	failures atomic.Int32
+	halt     context.CancelCauseFunc
 }
 
 // serve heartbeats and runs one claim loop per slot until drain ends, then waits for the leases in flight and
-// reports the runner offline. work stops those leases early.
-func (a *agent) serve(drain context.Context, work context.Context) {
+// reports the runner offline. work stops those leases early. When failureLimit leases in a row fail on the host it
+// stops claiming and reports draining until drain ends; when the server refuses the runner token it returns that.
+func (a *agent) serve(drain context.Context, work context.Context) error {
+	claiming, halt := context.WithCancelCause(drain)
+	defer halt(nil)
+	a.halt = halt
 	beating, stopBeating := context.WithCancel(context.Background())
 	var heartbeats sync.WaitGroup
-	heartbeats.Go(func() { a.heartbeat(beating, drain) })
+	heartbeats.Go(func() { a.heartbeat(beating, claiming) })
 
 	var slots sync.WaitGroup
 	for slot := range a.capacity {
-		slots.Go(func() { a.slot(drain, work, slot) })
+		slots.Go(func() { a.slot(claiming, work, slot) })
 	}
 	slots.Wait()
+	cause := context.Cause(claiming)
+	if errors.Is(cause, errUnhealthy) {
+		<-drain.Done()
+	}
 	stopBeating()
 	heartbeats.Wait()
 	a.beat(protocol.StatusOffline)
+	if errors.Is(cause, errRevoked) {
+		return cause
+	}
+	return nil
 }
 
 func (a *agent) heartbeat(ctx context.Context, drain context.Context) {
@@ -362,18 +432,24 @@ func (a *agent) beat(status string) {
 	}
 }
 
-// slot claims and runs one lease at a time. An empty queue or a failed claim backs off up to claimCeiling. Claims use
-// the work context, so a drain never abandons a claim whose lease the server already handed out.
-func (a *agent) slot(drain context.Context, work context.Context, slot int) {
+// slot claims and runs one lease at a time until claiming ends. An empty queue or a failed claim backs off up to
+// claimCeiling, and so does a lease that failed on the host. Claims use the work context, so a drain never abandons a
+// claim whose lease the server already handed out.
+func (a *agent) slot(claiming context.Context, work context.Context, slot int) {
 	logger := a.logger.With("slot", slot)
 	wait := claimInterval
-	for drain.Err() == nil && work.Err() == nil {
+	for claiming.Err() == nil && work.Err() == nil {
 		claimed, err := a.client.Claim(work, a.credentials, a.labels)
+		if revoked(err) {
+			logger.Error("claim refused", "error", err)
+			a.halt(errRevoked)
+			return
+		}
 		if err != nil || claimed == nil {
 			if err != nil {
 				logger.Warn("claim failed", "error", err)
 			}
-			if pause(drain, wait) != nil {
+			if pause(claiming, wait) != nil {
 				return
 			}
 			wait = min(wait*2, claimCeiling)
@@ -381,10 +457,29 @@ func (a *agent) slot(drain context.Context, work context.Context, slot int) {
 		}
 		wait = claimInterval
 		logger.Info("lease claimed", "lease", *claimed)
-		if err := a.runner.Run(work, *claimed); err != nil {
+		err = a.runner.Run(work, *claimed)
+		if err != nil {
 			logger.Warn("lease ended without a build", "lease", *claimed, "error", err)
 		}
+		if !lease.Infrastructure(err) {
+			a.failures.Store(0)
+			continue
+		}
+		failures := a.failures.Add(1)
+		if failures >= failureLimit {
+			logger.Error("draining", "error", errUnhealthy)
+			a.halt(errUnhealthy)
+			return
+		}
+		if pause(claiming, min(claimInterval<<failures, claimCeiling)) != nil {
+			return
+		}
 	}
+}
+
+func revoked(err error) bool {
+	var response *protocol.ResponseError
+	return errors.As(err, &response) && response.Status == http.StatusUnauthorized
 }
 
 func pause(ctx context.Context, duration time.Duration) error {

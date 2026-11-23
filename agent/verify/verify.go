@@ -31,6 +31,20 @@ var (
 	ErrTeam           = errors.New("verify: signing team differs from the lease")
 )
 
+// Rejected reports whether err is the IPA failing verification, rather than the host failing to read it. Only a
+// rejection describes the IPA; any other error may carry host paths.
+func Rejected(err error) bool {
+	for _, sentinel := range []error{
+		ErrArchive, ErrEntries, ErrSize, ErrBundle, ErrInfo, ErrExecutable, ErrUnsigned, ErrProfileMissing, ErrProfile,
+		ErrIdentifier, ErrVersionName, ErrVersionCode, ErrTeam,
+	} {
+		if errors.Is(err, sentinel) {
+			return true
+		}
+	}
+	return false
+}
+
 // Expected holds the lease values an IPA must match. Profiles maps bundle identifiers to provisioning profile bytes.
 type Expected struct {
 	Identifier  string
@@ -54,30 +68,40 @@ type Result struct {
 }
 
 type limits struct {
-	entries    int
-	size       uint64
-	plist      int64
-	profile    int64
-	executable int64
-	signature  int64
+	entries       int
+	directory     int64
+	size          uint64
+	plist         int64
+	profile       int64
+	executable    int64
+	signature     int64
+	entitlements  int
+	architectures uint32
 }
 
+// defaults bound what a hostile IPA can make the verifier read or allocate. directory bounds the bytes
+// archive/zip may read to find the end record and index the central directory, which it parses until a header fails
+// to decode whatever the end record declares; entitlements is the event size the result travels in.
 var defaults = limits{
-	entries:    100_000,
-	size:       16_000_000_000,
-	plist:      1 << 20,
-	profile:    1 << 20,
-	executable: 1 << 30,
-	signature:  16 << 20,
+	entries:       100_000,
+	directory:     16 << 20,
+	size:          16_000_000_000,
+	plist:         1 << 20,
+	profile:       1 << 20,
+	executable:    1 << 30,
+	signature:     16 << 20,
+	entitlements:  1 << 20,
+	architectures: 8,
 }
 
-// IPA verifies the IPA at path against the lease. On a mismatch the error matches every failed check through
+// IPA verifies the IPA at path against the lease, inflating a compressed executable into a temporary file under
+// spool (the system temporary directory when empty). On a mismatch the error matches every failed check through
 // errors.Is and the result still carries the digest and whatever the IPA declared, for reporting.
-func IPA(path string, expected Expected) (Result, error) {
-	return verify(path, expected, defaults)
+func IPA(path string, expected Expected, spool string) (Result, error) {
+	return verify(path, expected, spool, defaults)
 }
 
-func verify(path string, expected Expected, limits limits) (Result, error) {
+func verify(path string, expected Expected, spool string, limits limits) (Result, error) {
 	if expected.Identifier == "" || expected.VersionName == "" || expected.VersionCode == "" || expected.TeamID == "" {
 		return Result{}, errors.New("verify: expected identifier, version name, version code and team id are required")
 	}
@@ -93,23 +117,26 @@ func verify(path string, expected Expected, limits limits) (Result, error) {
 	}
 	result := Result{Digest: hex.EncodeToString(hash.Sum(nil)), Size: size}
 
-	ipa, err := open(file, size, limits)
+	ipa, err := open(file, size, spool, limits)
 	if err != nil {
 		return result, err
 	}
-	info, err := ipa.info()
+	bundle, err := ipa.info()
 	if err != nil {
 		return result, err
 	}
-	result.Identifier = info.identifier
-	result.VersionName = info.versionName
-	result.VersionCode = info.versionCode
+	result.Identifier = bundle.identifier
+	result.VersionName = bundle.versionName
+	result.VersionCode = bundle.versionCode
 
-	slices, err := ipa.signatures(info.executable)
+	slices, err := ipa.signatures(bundle.executable)
 	if err != nil {
 		return result, err
 	}
 	result.TeamID = slices[0].team
+	if length := len(slices[0].entitlements); length > limits.entitlements {
+		return result, fmt.Errorf("%w: entitlements of %d bytes, limit %d", ErrSize, length, limits.entitlements)
+	}
 	if slices[0].entitlements != nil {
 		if result.Entitlements, err = decodeDictionary(slices[0].entitlements); err != nil {
 			return result, fmt.Errorf("%w: entitlements: %w", ErrExecutable, err)
@@ -123,14 +150,14 @@ func verify(path string, expected Expected, limits limits) (Result, error) {
 	reason := ipa.unsigned(slices)
 
 	var failures []error
-	if info.identifier != expected.Identifier {
-		failures = append(failures, fmt.Errorf("%w: ipa has %q, lease has %q", ErrIdentifier, info.identifier, expected.Identifier))
+	if bundle.identifier != expected.Identifier {
+		failures = append(failures, fmt.Errorf("%w: ipa has %q, lease has %q", ErrIdentifier, bundle.identifier, expected.Identifier))
 	}
-	if info.versionName != expected.VersionName {
-		failures = append(failures, fmt.Errorf("%w: ipa has %q, lease has %q", ErrVersionName, info.versionName, expected.VersionName))
+	if bundle.versionName != expected.VersionName {
+		failures = append(failures, fmt.Errorf("%w: ipa has %q, lease has %q", ErrVersionName, bundle.versionName, expected.VersionName))
 	}
-	if info.versionCode != expected.VersionCode {
-		failures = append(failures, fmt.Errorf("%w: ipa has %q, lease has %q", ErrVersionCode, info.versionCode, expected.VersionCode))
+	if bundle.versionCode != expected.VersionCode {
+		failures = append(failures, fmt.Errorf("%w: ipa has %q, lease has %q", ErrVersionCode, bundle.versionCode, expected.VersionCode))
 	}
 	if reason != "" {
 		failures = append(failures, fmt.Errorf("%w: %s", ErrUnsigned, reason))
@@ -164,11 +191,17 @@ type archive struct {
 	files   []*zip.File
 	entries map[string]*zip.File
 	root    string
+	spool   string
 	limits  limits
 }
 
-func open(reader io.ReaderAt, size int64, limits limits) (*archive, error) {
-	zipped, err := zip.NewReader(reader, size)
+func open(reader io.ReaderAt, size int64, spool string, limits limits) (*archive, error) {
+	budget := &budgetReader{reader: reader, remaining: limits.directory}
+	zipped, err := zip.NewReader(budget, size)
+	budget.lift()
+	if errors.Is(err, errDirectory) {
+		return nil, fmt.Errorf("%w: the central directory exceeds %d bytes", ErrEntries, limits.directory)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrArchive, err)
 	}
@@ -198,7 +231,30 @@ func open(reader io.ReaderAt, size int64, limits limits) (*archive, error) {
 	for application := range applications {
 		root = "Payload/" + application + "/"
 	}
-	return &archive{reader: reader, size: size, files: zipped.File, entries: entries, root: root, limits: limits}, nil
+	return &archive{reader: reader, size: size, files: zipped.File, entries: entries, root: root, spool: spool, limits: limits}, nil
+}
+
+var errDirectory = errors.New("verify: central directory read budget exhausted")
+
+// budgetReader fails every read past its budget until lifted. It is not safe for concurrent use.
+type budgetReader struct {
+	reader    io.ReaderAt
+	remaining int64
+	lifted    bool
+}
+
+func (b *budgetReader) ReadAt(buffer []byte, offset int64) (int, error) {
+	if !b.lifted {
+		if int64(len(buffer)) > b.remaining {
+			return 0, errDirectory
+		}
+		b.remaining -= int64(len(buffer))
+	}
+	return b.reader.ReadAt(buffer, offset)
+}
+
+func (b *budgetReader) lift() {
+	b.lifted = true
 }
 
 func application(name string) (string, bool) {
@@ -245,23 +301,16 @@ type bundleInfo struct {
 }
 
 func (a *archive) info() (bundleInfo, error) {
-	data, err := a.read(a.root+"Info.plist", a.limits.plist)
-	if errors.Is(err, fs.ErrNotExist) {
-		return bundleInfo{}, fmt.Errorf("%w: %s has no Info.plist", ErrInfo, a.root)
-	}
+	dictionary, err := a.plist(a.root)
 	if err != nil {
 		return bundleInfo{}, err
 	}
-	dictionary, err := decodeDictionary(data)
-	if err != nil {
-		return bundleInfo{}, fmt.Errorf("%w: %w", ErrInfo, err)
-	}
-	var info bundleInfo
+	var bundle bundleInfo
 	for key, target := range map[string]*string{
-		"CFBundleIdentifier":         &info.identifier,
-		"CFBundleShortVersionString": &info.versionName,
-		"CFBundleVersion":            &info.versionCode,
-		"CFBundleExecutable":         &info.executable,
+		"CFBundleIdentifier":         &bundle.identifier,
+		"CFBundleShortVersionString": &bundle.versionName,
+		"CFBundleVersion":            &bundle.versionCode,
+		"CFBundleExecutable":         &bundle.executable,
 	} {
 		value, ok := dictionary[key].(string)
 		if !ok {
@@ -269,10 +318,26 @@ func (a *archive) info() (bundleInfo, error) {
 		}
 		*target = value
 	}
-	if info.executable == "" || info.executable == "." || info.executable == ".." || strings.Contains(info.executable, "/") {
-		return bundleInfo{}, fmt.Errorf("%w: CFBundleExecutable %q is not a file name", ErrInfo, info.executable)
+	if bundle.executable == "" || bundle.executable == "." || bundle.executable == ".." || strings.Contains(bundle.executable, "/") {
+		return bundleInfo{}, fmt.Errorf("%w: CFBundleExecutable %q is not a file name", ErrInfo, bundle.executable)
 	}
-	return info, nil
+	return bundle, nil
+}
+
+// plist decodes the Info.plist of the bundle at directory, a path inside the archive ending in "/".
+func (a *archive) plist(directory string) (map[string]any, error) {
+	data, err := a.read(directory+"Info.plist", a.limits.plist)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("%w: %s has no Info.plist", ErrInfo, directory)
+	}
+	if err != nil {
+		return nil, err
+	}
+	dictionary, err := decodeDictionary(data)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %w", ErrInfo, directory, err)
+	}
+	return dictionary, nil
 }
 
 func (a *archive) signatures(executable string) ([]signature, error) {
@@ -281,7 +346,7 @@ func (a *archive) signatures(executable string) ([]signature, error) {
 		return nil, err
 	}
 	defer release()
-	found, err := signatures(reader, size, a.limits.signature)
+	found, err := signatures(reader, size, a.limits.signature, a.limits.architectures)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrExecutable, err)
 	}
@@ -309,7 +374,7 @@ func (a *archive) executable(name string) (io.ReaderAt, int64, func(), error) {
 		return nil, 0, nil, fmt.Errorf("%w: %s: %w", ErrArchive, name, err)
 	}
 	defer reader.Close()
-	temporary, err := os.CreateTemp("", "verify-executable-*")
+	temporary, err := os.CreateTemp(a.spool, "verify-executable-*")
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("verify: spool executable: %w", err)
 	}
@@ -353,6 +418,9 @@ func (a *archive) unsigned(slices []signature) string {
 		if slice.adHoc {
 			return "executable is ad hoc signed"
 		}
+		if !slice.cms {
+			return "signature is not ad hoc but carries no CMS signature"
+		}
 	}
 	if _, ok := a.entries[a.root+"_CodeSignature/CodeResources"]; !ok {
 		return "bundle has no _CodeSignature/CodeResources"
@@ -360,27 +428,34 @@ func (a *archive) unsigned(slices []signature) string {
 	return ""
 }
 
-// nestedProfiles checks that every extension's or watch app's embedded profile is one the lease provided.
+// nestedProfiles checks that every extension's or watch app's embedded profile is the one the lease provided for
+// that bundle's own identifier.
 func (a *archive) nestedProfiles(profiles map[string][]byte) ([]error, error) {
 	var failures []error
 	for _, entry := range a.files {
 		name := entry.Name
-		if !strings.HasPrefix(name, a.root) || name == a.root+"embedded.mobileprovision" || !strings.HasSuffix(name, "/embedded.mobileprovision") {
+		directory, nested := strings.CutSuffix(name, "embedded.mobileprovision")
+		if !nested || !strings.HasPrefix(name, a.root) || directory == a.root || !strings.HasSuffix(directory, "/") {
 			continue
 		}
 		data, err := a.read(name, a.limits.profile)
 		if err != nil {
 			return nil, err
 		}
-		leased := false
-		for _, profile := range profiles {
-			if bytes.Equal(data, profile) {
-				leased = true
-				break
-			}
+		dictionary, err := a.plist(directory)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%w: %s: %v", ErrProfile, name, err))
+			continue
 		}
-		if !leased {
-			failures = append(failures, fmt.Errorf("%w: %s is not one of the lease's profiles", ErrProfile, name))
+		identifier, _ := dictionary["CFBundleIdentifier"].(string)
+		leased, ok := profiles[identifier]
+		switch {
+		case identifier == "":
+			failures = append(failures, fmt.Errorf("%w: %sInfo.plist has no CFBundleIdentifier", ErrProfile, directory))
+		case !ok:
+			failures = append(failures, fmt.Errorf("%w: lease has no profile for %q, which %s embeds", ErrProfile, identifier, directory))
+		case !bytes.Equal(data, leased):
+			failures = append(failures, fmt.Errorf("%w: %s differs from the profile for %q", ErrProfile, name, identifier))
 		}
 	}
 	return failures, nil

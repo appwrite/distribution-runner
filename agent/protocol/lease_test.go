@@ -21,8 +21,8 @@ func TestSessionSendsLeaseTokenAndQueryHeaders(t *testing.T) {
 	server.handle("POST "+leasePath+"/events", func(writer http.ResponseWriter, _ *http.Request) {
 		writer.WriteHeader(http.StatusNoContent)
 	})
-	server.handle("POST "+leasePath+"/artifacts", func(writer http.ResponseWriter, _ *http.Request) {
-		respond(t, writer, http.StatusAccepted, map[string]any{"$id": "upload1", "chunksTotal": 1, "chunksUploaded": 1})
+	server.handle("POST "+leasePath+"/artifacts", func(writer http.ResponseWriter, request *http.Request) {
+		respond(t, writer, http.StatusAccepted, map[string]any{"$id": request.Header.Get("X-Appwrite-Id"), "chunksTotal": 1, "chunksUploaded": 1})
 	})
 	path := filepath.Join(t.TempDir(), "app.ipa")
 	if err := os.WriteFile(path, []byte("ipa"), 0o600); err != nil {
@@ -65,7 +65,7 @@ func TestSessionSendsLeaseTokenAndQueryHeaders(t *testing.T) {
 func TestSessionRejectsUnsafeQueryKeys(t *testing.T) {
 	server := newFake(t)
 	client := server.client(t)
-	for _, key := range []string{"key", "jwt", "mode", "Mode", "response-format", "Response-Format", "", "project id", "project\r\nOrigin", "projé"} {
+	for _, key := range []string{"key", "jwt", "mode", "Mode", "response-format", "Response-Format", "", "project id", "project\r\nOrigin", "projé", "id", "Id"} {
 		lease := server.lease()
 		lease.Query = Map[string]{key: "value"}
 		if _, err := client.Session(Credentials{RunnerID: testRunnerID}, lease); err == nil {
@@ -103,6 +103,7 @@ func TestSessionValidatesLease(t *testing.T) {
 func TestExtendReportsCancel(t *testing.T) {
 	server := newFake(t)
 	server.handle("PATCH "+leasePath, func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Date", "Mon, 23 Nov 2026 10:00:00 GMT")
 		respond(t, writer, http.StatusOK, map[string]any{"expiresAt": "2026-11-23T10:05:00.000+00:00", "canceled": true})
 	})
 
@@ -114,8 +115,8 @@ func TestExtendReportsCancel(t *testing.T) {
 	if !extension.Canceled {
 		t.Error("Canceled = false, want true")
 	}
-	if !extension.ExpiresAt.Equal(time.Date(2026, 11, 23, 10, 5, 0, 0, time.UTC)) {
-		t.Errorf("ExpiresAt = %v", extension.ExpiresAt)
+	if remaining := time.Until(extension.ExpiresAt); remaining < 4*time.Minute || remaining > 5*time.Minute {
+		t.Errorf("ExpiresAt is %v away, want the 5 minutes the server's own clock gives", remaining)
 	}
 }
 

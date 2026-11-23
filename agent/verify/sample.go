@@ -24,8 +24,10 @@ type Spec struct {
 	XML bool
 	// Universal writes an arm64 and x86_64 executable instead of a thin arm64 one.
 	Universal bool
-	// AdHoc flags every code directory ad hoc and names no team.
+	// AdHoc flags every code directory ad hoc, names no team and leaves the CMS blob empty.
 	AdHoc bool
+	// EmptyCMS leaves the CMS blob empty, as only an ad hoc signature does.
+	EmptyCMS bool
 	// Unsigned writes an executable without LC_CODE_SIGNATURE.
 	Unsigned bool
 	// ExtraApp adds a second Payload/*.app.
@@ -180,7 +182,8 @@ func sampleExecutable(spec Spec, seal sealed) []byte {
 }
 
 // machOSlice writes a 64-bit MH_EXECUTE header and, unless spec.Unsigned, one LC_CODE_SIGNATURE whose superblob
-// holds a code directory hashing the header and the sealed files, the entitlements and an empty CMS wrapper.
+// holds a code directory hashing the header and the sealed files, the entitlements and a CMS wrapper, which holds a
+// placeholder rather than a real signature.
 func machOSlice(target architecture, spec Spec, seal sealed) []byte {
 	commands, commandsSize := uint32(0), uint32(0)
 	if !spec.Unsigned {
@@ -218,7 +221,7 @@ func sampleSuperBlob(spec Spec, code []byte, seal sealed) []byte {
 		{slot: 0, data: sampleCodeDirectory(spec, code, special)},
 		{slot: 2, data: requirements},
 		{slot: 5, data: entitlements},
-		{slot: 0x10000, data: blob(signatureWrapperMagic, nil)},
+		{slot: signatureWrapperSlot, data: blob(signatureWrapperMagic, sampleCMS(spec))},
 	}
 	header := uint32(12 + 8*len(blobs))
 	total := header
@@ -281,6 +284,13 @@ func sampleCodeDirectory(spec Spec, code []byte, special [][]byte) []byte {
 		}
 	}
 	return append(data, hash[:]...)
+}
+
+func sampleCMS(spec Spec) []byte {
+	if spec.AdHoc || spec.EmptyCMS {
+		return nil
+	}
+	return []byte("sample: not a CMS signature")
 }
 
 func blob(magic uint32, payload []byte) []byte {

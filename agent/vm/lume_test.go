@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -83,7 +84,7 @@ func (r *recorder) find(match func(*started) bool) []*started {
 
 func lumeCall(subcommand string) func(*started) bool {
 	return func(process *started) bool {
-		return process.Path == "lume" && len(process.Args) > 0 && process.Args[0] == subcommand
+		return process.Path == "lume" && len(process.Arguments) > 0 && process.Arguments[0] == subcommand
 	}
 }
 
@@ -135,11 +136,11 @@ func guest(overrides func(process Process, stdin string) (behaviour, bool)) func
 		}
 		switch process.Path {
 		case "lume":
-			switch process.Args[0] {
+			switch process.Arguments[0] {
 			case "run":
 				return behaviour{block: true}
 			case "get":
-				return behaviour{stdout: detailsJSON(process.Args[1], testAddress)}
+				return behaviour{stdout: detailsJSON(process.Arguments[1], testAddress)}
 			case "ls":
 				return behaviour{stdout: "[]"}
 			}
@@ -184,40 +185,85 @@ func TestLumeCreate(t *testing.T) {
 		t.Fatalf("machine = %+v", machine)
 	}
 	processes := runner.all()
-	argv := func(index int) []string { return append([]string{processes[index].Path}, processes[index].Args...) }
-	expected := [][]string{
-		{"lume", "clone", "golden", "lease-1"},
-		{"lume", "run", "lease-1", "--display", "none", "--vnc", "disabled"},
-		{"lume", "get", "lease-1", "--format", "json"},
+	argv := func(index int) []string {
+		return append([]string{processes[index].Path}, processes[index].Arguments...)
 	}
-	if len(processes) != 4 {
-		t.Fatalf("started %d processes, want 4", len(processes))
+	if len(processes) != 5 {
+		t.Fatalf("started %d processes, want 5", len(processes))
+	}
+	directory := machineDirectory(t, lume)
+	expected := [][]string{
+		{"lume", "ls", "--format", "json"},
+		{"lume", "clone", "golden", "lease-1"},
+		{"lume", "run", "lease-1", "--display", "none", "--vnc", "disabled", "--shared-dir", filepath.Join(directory, Share) + ":ro"},
+		{"lume", "get", "lease-1", "--format", "json"},
 	}
 	for index, want := range expected {
 		if got := argv(index); !slices.Equal(got, want) {
 			t.Fatalf("process %d = %q, want %q", index, got, want)
 		}
-		if !slices.Equal(processes[index].Env, []string{"LUME_TELEMETRY_ENABLED=false"}) {
-			t.Fatalf("process %d env = %q, want telemetry disabled", index, processes[index].Env)
+		if !slices.Equal(processes[index].Environment, []string{"LUME_TELEMETRY_ENABLED=false"}) {
+			t.Fatalf("process %d env = %q, want telemetry disabled", index, processes[index].Environment)
 		}
 	}
-	probe := processes[3]
+	probe := processes[4]
 	if probe.Path != "/usr/bin/ssh" || probe.stdin != homeScript {
-		t.Fatalf("probe = %q with stdin %q", argv(3), probe.stdin)
+		t.Fatalf("probe = %q with stdin %q", argv(4), probe.stdin)
 	}
-	if tail := probe.Args[len(probe.Args)-4:]; !slices.Equal(tail, []string{"-T", "--", testAddress, "/bin/sh -s"}) {
+	if tail := probe.Arguments[len(probe.Arguments)-4:]; !slices.Equal(tail, []string{"-T", "--", testAddress, "/bin/sh -s"}) {
 		t.Fatalf("ssh destination = %q", tail)
 	}
-	if processes[1].handle.wasKilled() {
+	if processes[2].handle.wasKilled() {
 		t.Fatal("lume run was killed by a successful create")
+	}
+	if _, err := os.Stat(filepath.Join(directory, Share)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the host key share outlived the boot: %v", err)
 	}
 }
 
-func TestLumeSSHOptions(t *testing.T) {
+// machineDirectory returns the one per-machine directory under lume.Directory.
+func machineDirectory(t *testing.T, lume *Lume) string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(lume.Directory, machinePrefix+"*"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("per-machine directories = %v, %v", matches, err)
+	}
+	return matches[0]
+}
+
+func TestLumePinsAHostKeyPerMachine(t *testing.T) {
+	var shared []string
+	lume, runner := newLume(t, guest(func(process Process, _ string) (behaviour, bool) {
+		if process.Path == "lume" && process.Arguments[0] == "run" {
+			share := strings.TrimSuffix(process.Arguments[len(process.Arguments)-1], ":ro")
+			private, _ := os.ReadFile(filepath.Join(share, HostKeyFile))
+			public, _ := os.ReadFile(filepath.Join(share, HostKeyFile+".pub"))
+			shared = append(shared, string(private), string(public))
+			return behaviour{block: true}, true
+		}
+		return behaviour{}, false
+	}))
+	lume.User = "builder"
+	createLume(t, lume, "first")
+	directory := machineDirectory(t, lume)
+	createLume(t, lume, "second")
+
+	if len(shared) != 4 || !strings.Contains(shared[0], "BEGIN OPENSSH PRIVATE KEY") || shared[0] == shared[2] {
+		t.Fatalf("shared keys = %d, want a distinct private key per machine", len(shared))
+	}
+	pinned, err := os.ReadFile(filepath.Join(directory, knownHosts))
+	if err != nil {
+		t.Fatal(err)
+	}
+	public := strings.Fields(shared[1])
+	if string(pinned) != "first "+public[0]+" "+public[1]+"\n" {
+		t.Fatalf("known_hosts = %q, want the shared public key under the machine name", pinned)
+	}
+
 	common := []string{
 		"-F", "none",
 		"-i", testKey,
-		"-o", "User=lume",
+		"-o", "User=builder",
 		"-o", "IdentitiesOnly=yes",
 		"-o", "IdentityAgent=none",
 		"-o", "BatchMode=yes",
@@ -226,62 +272,43 @@ func TestLumeSSHOptions(t *testing.T) {
 		"-o", "ControlPath=none",
 		"-o", "ForwardAgent=no",
 		"-o", "ClearAllForwardings=yes",
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", "HostKeyAlgorithms=ssh-ed25519",
+		"-o", "UserKnownHostsFile=" + filepath.Join(directory, knownHosts),
+		"-o", "HostKeyAlias=first",
 	}
-	contains := func(argv []string, pair []string) bool {
-		for index := 0; index+1 < len(argv); index++ {
-			if argv[index] == pair[0] && argv[index+1] == pair[1] {
-				return true
-			}
+	argv := runner.all()[4].Arguments
+	for index := 0; index < len(common); index += 2 {
+		pair := common[index : index+2]
+		found := false
+		for position := 0; position+1 < len(argv); position++ {
+			found = found || (argv[position] == pair[0] && argv[position+1] == pair[1])
 		}
-		return false
+		if !found {
+			t.Fatalf("ssh argv %q lacks %q", argv, pair)
+		}
 	}
+}
 
-	t.Run("pinned", func(t *testing.T) {
-		lume, runner := newLume(t, guest(nil))
-		lume.KnownHosts = "/etc/distribution/known_hosts"
-		lume.User = "builder"
-		createLume(t, lume, "pinned")
-		argv := runner.all()[3].Args
-		for index := 0; index < len(common); index += 2 {
-			pair := common[index : index+2]
-			if pair[1] == "User=lume" {
-				pair = []string{"-o", "User=builder"}
-			}
-			if !contains(argv, pair) {
-				t.Fatalf("ssh argv %q lacks %q", argv, pair)
-			}
-		}
-		for _, pair := range [][]string{
-			{"-o", "StrictHostKeyChecking=yes"},
-			{"-o", "UserKnownHostsFile=/etc/distribution/known_hosts"},
-			{"-o", "HostKeyAlias=golden"},
-		} {
-			if !contains(argv, pair) {
-				t.Fatalf("ssh argv %q lacks %q", argv, pair)
-			}
-		}
-	})
+func TestHostKeyIsReadableByOpenSSH(t *testing.T) {
+	keygen, err := exec.LookPath("ssh-keygen")
+	if err != nil {
+		t.Skip("ssh-keygen is not installed")
+	}
+	key, err := newHostKey("machine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), HostKeyFile)
+	writeFile(t, path, string(key.Private), 0o600)
 
-	t.Run("first use", func(t *testing.T) {
-		lume, runner := newLume(t, guest(nil))
-		createLume(t, lume, "first")
-		argv := runner.all()[3].Args
-		if !contains(argv, []string{"-o", "StrictHostKeyChecking=accept-new"}) {
-			t.Fatalf("ssh argv %q does not accept the first key", argv)
-		}
-		var file string
-		for _, argument := range argv {
-			if value, ok := strings.CutPrefix(argument, "UserKnownHostsFile="); ok {
-				file = value
-			}
-		}
-		if !strings.HasPrefix(file, lume.Directory+string(filepath.Separator)) || filepath.Base(file) != "known_hosts" {
-			t.Fatalf("known hosts file %q is not per machine", file)
-		}
-		if slices.ContainsFunc(argv, func(argument string) bool { return strings.HasPrefix(argument, "HostKeyAlias=") }) {
-			t.Fatal("first-use mode sets a host key alias")
-		}
-	})
+	output, err := exec.Command(keygen, "-y", "-f", path).Output()
+	if err != nil {
+		t.Fatalf("ssh-keygen -y: %v", err)
+	}
+	if derived := strings.Fields(string(output)); len(derived) < 2 || derived[0]+" "+derived[1] != key.Public {
+		t.Fatalf("ssh-keygen derived %q, want %q", output, key.Public)
+	}
 }
 
 func TestLumeExecKeepsArgumentsAndSecretsOutOfArgv(t *testing.T) {
@@ -302,7 +329,7 @@ func TestLumeExecKeepsArgumentsAndSecretsOutOfArgv(t *testing.T) {
 	var stdout, stderr strings.Builder
 	env := map[string]string{"DISTRIBUTION_WORK": testHome + "/distribution", "TOKEN": secret}
 	args := append([]string{"/usr/local/distribution/build.sh", argument}, awkward...)
-	code, err := lume.Exec(context.Background(), machine, Command{Args: args, Env: env, Stdout: &stdout, Stderr: &stderr})
+	code, err := lume.Exec(context.Background(), machine, Command{Arguments: args, Environment: env, Stdout: &stdout, Stderr: &stderr})
 	if err != nil || code != 7 {
 		t.Fatalf("exec = %d, %v; want 7, nil", code, err)
 	}
@@ -311,7 +338,7 @@ func TestLumeExecKeepsArgumentsAndSecretsOutOfArgv(t *testing.T) {
 	}
 
 	for _, process := range runner.all() {
-		for _, value := range append(append([]string{process.Path}, process.Args...), process.Env...) {
+		for _, value := range append(append([]string{process.Path}, process.Arguments...), process.Environment...) {
 			if strings.Contains(value, secret) || strings.Contains(value, argument) {
 				t.Fatalf("argv or env of %s carries a secret: %q", process.Path, value)
 			}
@@ -334,7 +361,7 @@ func TestLumeExecScriptDecodesBack(t *testing.T) {
 
 	env := map[string]string{"VALUE": "it's $HOME `id`\n\"quoted\"", "DISTRIBUTION_WORK": "/Users/lume/distribution"}
 	args := append([]string{"/bin/sh", "-c", `printf '%s\0' "$VALUE" "$DISTRIBUTION_WORK" "$@"`, "_"}, awkward...)
-	if _, err := lume.Exec(context.Background(), machine, Command{Args: args, Env: env}); err != nil {
+	if _, err := lume.Exec(context.Background(), machine, Command{Arguments: args, Environment: env}); err != nil {
 		t.Fatal(err)
 	}
 	execs := runner.find(func(process *started) bool { return strings.Contains(process.stdin, "exec ") })
@@ -367,7 +394,7 @@ func TestLumeExecCancellationKillsTheRemoteCommand(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		_, err := lume.Exec(ctx, machine, Command{Args: []string{"sleep", "3600"}})
+		_, err := lume.Exec(ctx, machine, Command{Arguments: []string{"sleep", "3600"}})
 		result <- err
 	}()
 	var execution *started
@@ -406,7 +433,14 @@ func TestLumeExecCancellationKillsTheRemoteCommand(t *testing.T) {
 }
 
 func TestLumeCopy(t *testing.T) {
-	lume, runner := newLume(t, guest(nil))
+	const content = "ipa bytes"
+	source := testHome + "/distribution/output/app.ipa"
+	lume, runner := newLume(t, guest(func(process Process, stdin string) (behaviour, bool) {
+		if process.Path == "/usr/bin/ssh" && stdin == readScript(source) {
+			return behaviour{stdout: content}, true
+		}
+		return behaviour{}, false
+	}))
 	machine := createLume(t, lume, "copy")
 	ctx := context.Background()
 	host := t.TempDir()
@@ -416,12 +450,13 @@ func TestLumeCopy(t *testing.T) {
 	if err := lume.Copy(ctx, machine, in); err != nil {
 		t.Fatalf("copy in: %v", err)
 	}
-	out := Transfer{Direction: Out, Source: testHome + "/distribution/output/app.ipa", Destination: filepath.Join(host, "result", "app.ipa")}
-	if err := lume.Copy(ctx, machine, out); err != nil {
+	destination := filepath.Join(host, "result", "app.ipa")
+	if err := lume.Copy(ctx, machine, Transfer{Direction: Out, Source: source, Destination: destination, Limit: 1 << 20}); err != nil {
 		t.Fatalf("copy out: %v", err)
 	}
-	if information, err := os.Stat(filepath.Join(host, "result")); err != nil || !information.IsDir() {
-		t.Fatalf("copy out did not create the parent: %v", err)
+	information, err := os.Lstat(destination)
+	if err != nil || !information.Mode().IsRegular() || information.Mode().Perm() != 0o600 || readFile(t, destination) != content {
+		t.Fatalf("copied file = %v, %v", information, err)
 	}
 
 	prepare := runner.find(func(process *started) bool { return strings.HasPrefix(process.stdin, "set -e\nmkdir") })
@@ -429,24 +464,74 @@ func TestLumeCopy(t *testing.T) {
 		t.Fatalf("prepare scripts = %d", len(prepare))
 	}
 	copies := runner.find(func(process *started) bool { return process.Path == "/usr/bin/scp" })
-	if len(copies) != 2 {
-		t.Fatalf("found %d scp processes", len(copies))
+	if len(copies) != 1 {
+		t.Fatalf("found %d scp processes, want only the copy in", len(copies))
 	}
-	tails := [][]string{
-		{"-q", "-p", "-r", "--", filepath.Join(host, "signing"), testAddress + ":" + testHome + "/distribution/input/signing"},
-		{"-q", "-p", "-r", "--", testAddress + ":" + testHome + "/distribution/output/app.ipa", filepath.Join(host, "result", "app.ipa")},
+	argv := copies[0].Arguments
+	want := []string{"-q", "-p", "-r", "--", filepath.Join(host, "signing"), testAddress + ":" + testHome + "/distribution/input/signing"}
+	if got := argv[len(argv)-len(want):]; !slices.Equal(got, want) {
+		t.Fatalf("scp = %q, want suffix %q", argv, want)
 	}
-	for index, want := range tails {
-		argv := copies[index].Args
-		if got := argv[len(argv)-len(want):]; !slices.Equal(got, want) {
-			t.Fatalf("scp %d = %q, want suffix %q", index, argv, want)
+	if slices.Contains(argv, "-T") || slices.Contains(argv, "-O") || !slices.Contains(argv, "IdentitiesOnly=yes") {
+		t.Fatalf("scp does not share the ssh options or weakens filename checking: %q", argv)
+	}
+	reads := runner.find(func(process *started) bool { return process.stdin == readScript(source) })
+	if len(reads) != 1 || reads[0].Path != "/usr/bin/ssh" {
+		t.Fatalf("found %d reads of %s over ssh", len(reads), source)
+	}
+}
+
+func TestLumeCopyOutRefusesWhatIsNotABoundedFile(t *testing.T) {
+	lume, _ := newLume(t, guest(func(process Process, stdin string) (behaviour, bool) {
+		switch {
+		case stdin == readScript(testHome+"/huge"):
+			return behaviour{stdout: strings.Repeat("x", 2048)}, true
+		case stdin == readScript(testHome+"/directory"):
+			return behaviour{code: notFile}, true
+		case stdin == readScript(testHome+"/broken"):
+			_, _ = io.WriteString(process.Stderr, "cat: read error\n")
+			return behaviour{code: 1}, true
 		}
-		if slices.Contains(argv, "-T") || slices.Contains(argv, "-O") {
-			t.Fatalf("scp %d weakens filename checking or forces the legacy protocol: %q", index, argv)
-		}
-		if !slices.Contains(argv, "IdentitiesOnly=yes") {
-			t.Fatalf("scp %d does not share the ssh options: %q", index, argv)
-		}
+		return behaviour{}, false
+	}))
+	machine := createLume(t, lume, "bounded")
+	host := t.TempDir()
+	existing := filepath.Join(host, "existing")
+	writeFile(t, existing, "kept", 0o600)
+
+	cases := map[string]struct {
+		source      string
+		destination string
+		want        error
+		message     string
+	}{
+		"over the limit":       {source: "huge", destination: filepath.Join(host, "huge"), want: ErrLimit},
+		"not a regular file":   {source: "directory", destination: filepath.Join(host, "directory"), want: ErrNotFile},
+		"existing destination": {source: "file", destination: existing, want: ErrDestination},
+		"existing directory":   {source: "file", destination: t.TempDir(), want: ErrDestination},
+		"failing read":         {source: "broken", destination: filepath.Join(host, "broken"), message: "cat: read error"},
+	}
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := lume.Copy(context.Background(), machine, Transfer{Direction: Out, Source: test.source, Destination: test.destination, Limit: 1024})
+			if test.want != nil && !errors.Is(err, test.want) {
+				t.Fatalf("copy = %v, want %v", err, test.want)
+			}
+			if test.message != "" && (err == nil || !strings.Contains(err.Error(), test.message)) {
+				t.Fatalf("copy = %v, want %q", err, test.message)
+			}
+			if test.want != ErrDestination {
+				if _, statErr := os.Lstat(test.destination); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("a refused copy left %s behind: %v", test.destination, statErr)
+				}
+			}
+		})
+	}
+	if readFile(t, existing) != "kept" {
+		t.Fatal("a refused copy overwrote an existing file")
+	}
+	if err := lume.Copy(context.Background(), machine, Transfer{Direction: Out, Source: "file", Destination: filepath.Join(host, "unbounded")}); err == nil {
+		t.Fatal("a copy out without a limit was accepted")
 	}
 }
 
@@ -464,9 +549,6 @@ func TestLumeCopyRefusesDirectories(t *testing.T) {
 	if err := lume.Copy(context.Background(), machine, Transfer{Direction: In, Source: source, Destination: "exists"}); !errors.Is(err, ErrDestination) {
 		t.Fatalf("copy in onto a directory = %v", err)
 	}
-	if err := lume.Copy(context.Background(), machine, Transfer{Direction: Out, Source: "file", Destination: t.TempDir()}); !errors.Is(err, ErrDestination) {
-		t.Fatalf("copy out onto a directory = %v", err)
-	}
 	if err := lume.Copy(context.Background(), machine, Transfer{Direction: In, Source: filepath.Join(t.TempDir(), "missing"), Destination: "x"}); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("copy of a missing source = %v", err)
 	}
@@ -481,7 +563,9 @@ func TestLumeCopyFailureReportsStderr(t *testing.T) {
 		return behaviour{}, false
 	}))
 	machine := createLume(t, lume, "scp")
-	err := lume.Copy(context.Background(), machine, Transfer{Direction: Out, Source: "missing", Destination: filepath.Join(t.TempDir(), "x")})
+	source := filepath.Join(t.TempDir(), "file")
+	writeFile(t, source, "x", 0o600)
+	err := lume.Copy(context.Background(), machine, Transfer{Direction: In, Source: source, Destination: "file"})
 	if err == nil || !strings.Contains(err.Error(), "scp: no such file") {
 		t.Fatalf("copy = %v", err)
 	}
@@ -494,10 +578,10 @@ func TestLumeDestroyIsIdempotent(t *testing.T) {
 	lume, runner := newLume(t, guest(func(process Process, _ string) (behaviour, bool) {
 		mutex.Lock()
 		defer mutex.Unlock()
-		if process.Path == "lume" && process.Args[0] == "delete" {
+		if process.Path == "lume" && process.Arguments[0] == "delete" {
 			return behaviour{code: deleteCode}, true
 		}
-		if process.Path == "lume" && process.Args[0] == "ls" && present {
+		if process.Path == "lume" && process.Arguments[0] == "ls" && present {
 			return behaviour{stdout: detailsJSON("gone", testAddress)}, true
 		}
 		return behaviour{}, false
@@ -513,13 +597,13 @@ func TestLumeDestroyIsIdempotent(t *testing.T) {
 		t.Fatal("lume run was not killed")
 	}
 	deletes := runner.find(lumeCall("delete"))
-	if len(deletes) != 1 || !slices.Equal(deletes[0].Args, []string{"delete", "gone", "--force"}) {
+	if len(deletes) != 1 || !slices.Equal(deletes[0].Arguments, []string{"delete", "gone", "--force"}) {
 		t.Fatalf("deletes = %d", len(deletes))
 	}
 	if entries, _ := os.ReadDir(lume.Directory); len(entries) != 0 {
 		t.Fatalf("per-machine directory survived: %v", entries)
 	}
-	if _, err := lume.Exec(ctx, machine, Command{Args: []string{"true"}}); !errors.Is(err, ErrNotFound) {
+	if _, err := lume.Exec(ctx, machine, Command{Arguments: []string{"true"}}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("exec after destroy = %v", err)
 	}
 
@@ -529,7 +613,7 @@ func TestLumeDestroyIsIdempotent(t *testing.T) {
 	if err := lume.Destroy(ctx, machine); err != nil {
 		t.Fatalf("second destroy: %v", err)
 	}
-	if stops := runner.find(lumeCall("stop")); len(stops) != 1 || !slices.Equal(stops[0].Args, []string{"stop", "gone", "--force"}) {
+	if stops := runner.find(lumeCall("stop")); len(stops) != 1 || !slices.Equal(stops[0].Arguments, []string{"stop", "gone", "--force"}) {
 		t.Fatalf("stops = %d", len(stops))
 	}
 
@@ -548,7 +632,7 @@ func TestLumeDestroyIsIdempotent(t *testing.T) {
 
 func TestLumeCreateCleansUpWhenBootTimesOut(t *testing.T) {
 	lume, runner := newLume(t, guest(func(process Process, _ string) (behaviour, bool) {
-		if process.Path == "lume" && process.Args[0] == "get" {
+		if process.Path == "lume" && process.Arguments[0] == "get" {
 			return behaviour{stdout: `[{"name":"slow","status":"running","ipAddress":null,"sshAvailable":null}]`}, true
 		}
 		return behaviour{}, false
@@ -591,7 +675,7 @@ func TestLumeCreateRejectsInvalidAddress(t *testing.T) {
 	for index, address := range []string{"-oProxyCommand=touch /tmp/owned", "0.0.0.0", "fe80::1%en0", "example.com"} {
 		t.Run(fmt.Sprintf("address %d", index), func(t *testing.T) {
 			lume, runner := newLume(t, guest(func(process Process, _ string) (behaviour, bool) {
-				if process.Path == "lume" && process.Args[0] == "get" {
+				if process.Path == "lume" && process.Arguments[0] == "get" {
 					return behaviour{stdout: detailsJSON("bad", address)}, true
 				}
 				return behaviour{}, false
@@ -600,7 +684,7 @@ func TestLumeCreateRejectsInvalidAddress(t *testing.T) {
 				t.Fatalf("create = %v, want an invalid address error", err)
 			}
 			if ssh := runner.find(func(process *started) bool { return process.Path == "/usr/bin/ssh" }); len(ssh) != 0 {
-				t.Fatalf("ssh ran against an invalid address: %q", ssh[0].Args)
+				t.Fatalf("ssh ran against an invalid address: %q", ssh[0].Arguments)
 			}
 			if len(runner.find(lumeCall("delete"))) != 1 {
 				t.Fatal("the clone was not deleted")
@@ -611,7 +695,7 @@ func TestLumeCreateRejectsInvalidAddress(t *testing.T) {
 
 func TestLumeCreateAcceptsIPv6(t *testing.T) {
 	lume, runner := newLume(t, guest(func(process Process, _ string) (behaviour, bool) {
-		if process.Path == "lume" && process.Args[0] == "get" {
+		if process.Path == "lume" && process.Arguments[0] == "get" {
 			return behaviour{stdout: detailsJSON("six", "fd00::5")}, true
 		}
 		return behaviour{}, false
@@ -623,18 +707,18 @@ func TestLumeCreateAcceptsIPv6(t *testing.T) {
 		t.Fatal(err)
 	}
 	scp := runner.find(func(process *started) bool { return process.Path == "/usr/bin/scp" })[0]
-	if target := scp.Args[len(scp.Args)-1]; target != "[fd00::5]:"+testHome+"/file" {
+	if target := scp.Arguments[len(scp.Arguments)-1]; target != "[fd00::5]:"+testHome+"/file" {
 		t.Fatalf("scp target = %q", target)
 	}
 }
 
 func TestLumeCreateFailsWhenRunExits(t *testing.T) {
 	lume, runner := newLume(t, guest(func(process Process, _ string) (behaviour, bool) {
-		if process.Path == "lume" && process.Args[0] == "run" {
+		if process.Path == "lume" && process.Arguments[0] == "run" {
 			_, _ = io.WriteString(process.Stderr, "Virtualization error\n")
 			return behaviour{code: 1}, true
 		}
-		if process.Path == "lume" && process.Args[0] == "get" {
+		if process.Path == "lume" && process.Arguments[0] == "get" {
 			return behaviour{stdout: `[{"name":"dead","status":"stopped"}]`}, true
 		}
 		return behaviour{}, false
@@ -648,29 +732,108 @@ func TestLumeCreateFailsWhenRunExits(t *testing.T) {
 	}
 }
 
-func TestLumeCloneFailureLeavesExistingMachinesAlone(t *testing.T) {
+func TestLumeCreateLeavesAnExistingMachineAlone(t *testing.T) {
 	lume, runner := newLume(t, guest(func(process Process, _ string) (behaviour, bool) {
-		if process.Path == "lume" && process.Args[0] == "clone" {
-			_, _ = io.WriteString(process.Stderr, "Virtual machine already exists with name: taken\n")
-			return behaviour{code: 1}, true
+		if process.Path == "lume" && process.Arguments[0] == "ls" {
+			return behaviour{stdout: detailsJSON("taken", testAddress)}, true
 		}
 		return behaviour{}, false
 	}))
 	_, err := lume.Create(context.Background(), "taken")
-	if err == nil || !strings.Contains(err.Error(), "already exists") {
-		t.Fatalf("create = %v", err)
+	if !errors.Is(err, ErrExists) {
+		t.Fatalf("create = %v, want exists", err)
 	}
 	if len(runner.all()) != 1 {
-		t.Fatalf("started %d processes after a failed clone, want only the clone", len(runner.all()))
+		t.Fatalf("started %d processes for an existing machine, want only the listing", len(runner.all()))
+	}
+	if entries, _ := os.ReadDir(lume.Directory); len(entries) != 0 {
+		t.Fatalf("per-machine directory survived: %v", entries)
+	}
+	if _, err := lume.Create(context.Background(), "taken"); !errors.Is(err, ErrExists) {
+		t.Fatalf("the refused name stayed reserved: %v", err)
+	}
+}
+
+func TestLumeCloneFailureDeletesThePartialClone(t *testing.T) {
+	lume, runner := newLume(t, guest(func(process Process, _ string) (behaviour, bool) {
+		if process.Path == "lume" && process.Arguments[0] == "clone" {
+			_, _ = io.WriteString(process.Stderr, "No space left on device\n")
+			return behaviour{code: 1}, true
+		}
+		return behaviour{}, false
+	}))
+	_, err := lume.Create(context.Background(), "partial")
+	if err == nil || !strings.Contains(err.Error(), "No space left") {
+		t.Fatalf("create = %v", err)
+	}
+	if deletes := runner.find(lumeCall("delete")); len(deletes) != 1 || !slices.Equal(deletes[0].Arguments, []string{"delete", "partial", "--force"}) {
+		t.Fatalf("deletes = %d, want the partial clone deleted", len(deletes))
 	}
 	if entries, _ := os.ReadDir(lume.Directory); len(entries) != 0 {
 		t.Fatalf("per-machine directory survived: %v", entries)
 	}
 }
 
+func TestLumeCreateRetriesATransientListing(t *testing.T) {
+	gets := 0
+	lume, _ := newLume(t, guest(func(process Process, _ string) (behaviour, bool) {
+		if process.Path == "lume" && process.Arguments[0] == "get" {
+			gets++
+			if gets == 1 {
+				return behaviour{code: 1}, true
+			}
+		}
+		return behaviour{}, false
+	}))
+	if machine := createLume(t, lume, "flaky"); machine.Address != testAddress || gets < 2 {
+		t.Fatalf("machine = %+v after %d listings", machine, gets)
+	}
+}
+
+func TestLumeSweep(t *testing.T) {
+	var listing atomic.Value
+	listing.Store("[]")
+	lume, runner := newLume(t, guest(func(process Process, _ string) (behaviour, bool) {
+		if process.Path == "lume" && process.Arguments[0] == "ls" {
+			return behaviour{stdout: listing.Load().(string)}, true
+		}
+		return behaviour{}, false
+	}))
+	live := createLume(t, lume, "distribution-live")
+	listing.Store(`[{"name":"distribution-old"},{"name":"golden"},{"name":"distribution-live"}]`)
+	stale := filepath.Join(lume.Directory, machinePrefix+"distribution-old-123")
+	unrelated := filepath.Join(lume.Directory, machinePrefix+"golden-456")
+	for _, directory := range []string{stale, unrelated} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := lume.Sweep(context.Background(), "distribution-"); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	deletes := runner.find(lumeCall("delete"))
+	if len(deletes) != 1 || !slices.Equal(deletes[0].Arguments, []string{"delete", "distribution-old", "--force"}) {
+		t.Fatalf("deletes = %d, want only the machine this Lume does not own", len(deletes))
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale directory survived: %v", err)
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Fatalf("an unrelated directory was removed: %v", err)
+	}
+	if _, err := lume.Exec(context.Background(), live, Command{Arguments: []string{"true"}}); err != nil {
+		t.Fatalf("the live machine did not survive the sweep: %v", err)
+	}
+	if err := lume.Sweep(context.Background(), "-x"); err == nil {
+		t.Fatal("sweep accepted an option-like prefix")
+	}
+}
+
 func TestLumeCreateHonoursCancellation(t *testing.T) {
 	lume, runner := newLume(t, guest(func(process Process, _ string) (behaviour, bool) {
-		if process.Path == "lume" && process.Args[0] == "get" {
+		if process.Path == "lume" && process.Arguments[0] == "get" {
 			return behaviour{stdout: "[]"}, true
 		}
 		return behaviour{}, false
@@ -701,8 +864,6 @@ func TestLumeValidatesConfiguration(t *testing.T) {
 		"no key":              func(l *Lume) { l.Key = "" },
 		"key with a space":    func(l *Lume) { l.Key = "/keys/my key" },
 		"key with a token":    func(l *Lume) { l.Key = "/keys/%u" },
-		"known hosts space":   func(l *Lume) { l.KnownHosts = "/a b" },
-		"alias with a quote":  func(l *Lume) { l.Alias = `a"b` },
 		"user with an option": func(l *Lume) { l.User = "-oProxyCommand=x" },
 	}
 	for name, mutate := range tests {
@@ -722,13 +883,13 @@ func TestLumeValidatesConfiguration(t *testing.T) {
 		t.Fatal("create accepted an option-like name")
 	}
 	machine := createLume(t, lume, "valid")
-	if _, err := lume.Exec(context.Background(), machine, Command{Args: []string{"true"}, Env: map[string]string{"A=B": "x"}}); err == nil {
+	if _, err := lume.Exec(context.Background(), machine, Command{Arguments: []string{"true"}, Environment: map[string]string{"A=B": "x"}}); err == nil {
 		t.Fatal("exec accepted an invalid environment name")
 	}
-	if _, err := lume.Exec(context.Background(), machine, Command{Args: []string{"a\x00b"}}); err == nil {
+	if _, err := lume.Exec(context.Background(), machine, Command{Arguments: []string{"a\x00b"}}); err == nil {
 		t.Fatal("exec accepted a NUL byte")
 	}
-	if _, err := lume.Exec(context.Background(), Machine{Name: "valid", Address: "10.0.0.1"}, Command{Args: []string{"true"}}); !errors.Is(err, ErrNotFound) {
+	if _, err := lume.Exec(context.Background(), Machine{Name: "valid", Address: "10.0.0.1"}, Command{Arguments: []string{"true"}}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("exec on a stale machine = %v", err)
 	}
 }

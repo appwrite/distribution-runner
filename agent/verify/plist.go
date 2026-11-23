@@ -20,6 +20,12 @@ var errPlist = errors.New("invalid property list")
 const (
 	plistDepth = 256
 	plistNodes = 1 << 20
+	// decodedRatio and decodedFloor set the decoded-size budget of a binary property list: decodedRatio times its
+	// length plus decodedFloor. Objects are shared by reference, so without it a small file decodes into a huge tree.
+	decodedRatio = 16
+	decodedFloor = 1 << 20
+	// valueWeight is what every decoded value and every container slot counts against that budget, besides its bytes.
+	valueWeight = 8
 	// referenceUnix is 2001-01-01T00:00:00Z, the epoch of binary property list dates.
 	referenceUnix = 978307200
 )
@@ -50,12 +56,22 @@ func decodeDictionary(data []byte) (map[string]any, error) {
 	return dictionary, nil
 }
 
+// binaryPlist decodes each object once and hands every further reference the same value, so shared objects cost
+// their memory once; the budget still counts each reference in full, bounding the tree a caller walks.
 type binaryPlist struct {
 	data          []byte
 	offsets       []uint64
 	referenceSize int
 	visiting      []bool
+	decoded       []decodedObject
 	nodes         int
+	budget        uint64
+}
+
+type decodedObject struct {
+	value  any
+	weight uint64
+	done   bool
 }
 
 func decodeBinary(data []byte) (any, error) {
@@ -90,8 +106,11 @@ func decodeBinary(data []byte) (any, error) {
 		offsets:       offsets,
 		referenceSize: referenceSize,
 		visiting:      make([]bool, count),
+		decoded:       make([]decodedObject, count),
+		budget:        decodedRatio*uint64(len(data)) + decodedFloor,
 	}
-	return decoder.object(top, 0)
+	value, _, err := decoder.object(top, 0)
+	return value, err
 }
 
 func integerWidth(size int) bool {
@@ -106,87 +125,119 @@ func readUnsigned(data []byte) uint64 {
 	return value
 }
 
-func (p *binaryPlist) object(index uint64, depth int) (any, error) {
+// object returns the decoded value of an object and its weight: valueWeight per value and container slot plus the
+// bytes of every string and data value in its tree.
+func (p *binaryPlist) object(index uint64, depth int) (any, uint64, error) {
 	if index >= uint64(len(p.offsets)) {
-		return nil, fmt.Errorf("%w: reference %d out of range", errPlist, index)
+		return nil, 0, fmt.Errorf("%w: reference %d out of range", errPlist, index)
 	}
 	if depth > plistDepth {
-		return nil, fmt.Errorf("%w: nested deeper than %d", errPlist, plistDepth)
+		return nil, 0, fmt.Errorf("%w: nested deeper than %d", errPlist, plistDepth)
 	}
 	p.nodes++
 	if p.nodes > plistNodes {
-		return nil, fmt.Errorf("%w: more than %d values", errPlist, plistNodes)
+		return nil, 0, fmt.Errorf("%w: more than %d values", errPlist, plistNodes)
+	}
+	if cached := p.decoded[index]; cached.done {
+		return cached.value, cached.weight, p.spend(cached.weight)
 	}
 	if p.visiting[index] {
-		return nil, fmt.Errorf("%w: object %d contains itself", errPlist, index)
+		return nil, 0, fmt.Errorf("%w: object %d contains itself", errPlist, index)
 	}
-	offset := p.offsets[index]
+	p.visiting[index] = true
+	defer func() { p.visiting[index] = false }()
+	value, weight, err := p.decode(p.offsets[index], depth)
+	if err != nil {
+		return nil, 0, err
+	}
+	if _, container := value.([]any); !container {
+		if _, container = value.(map[string]any); !container {
+			if err := p.spend(weight); err != nil {
+				return nil, 0, err
+			}
+		}
+	}
+	p.decoded[index] = decodedObject{value: value, weight: weight, done: true}
+	return value, weight, nil
+}
+
+// spend charges weight to the budget. A container's own slots and children are charged as they are decoded.
+func (p *binaryPlist) spend(weight uint64) error {
+	if weight > p.budget {
+		return fmt.Errorf("%w: decodes to more than %d times its size", errPlist, decodedRatio)
+	}
+	p.budget -= weight
+	return nil
+}
+
+func (p *binaryPlist) decode(offset uint64, depth int) (any, uint64, error) {
 	marker := p.data[offset]
-	kind, info := marker>>4, marker&0x0F
+	kind, detail := marker>>4, marker&0x0F
 	body := offset + 1
 	switch kind {
 	case 0x0:
 		switch marker {
 		case 0x08:
-			return false, nil
+			return false, valueWeight, nil
 		case 0x09:
-			return true, nil
+			return true, valueWeight, nil
 		}
 	case 0x1:
-		return p.integer(body, info)
+		value, err := p.integer(body, detail)
+		return value, valueWeight, err
 	case 0x2:
-		return p.real(body, info)
+		value, err := p.real(body, detail)
+		return value, valueWeight, err
 	case 0x3:
 		if marker == 0x33 {
-			return p.date(body)
+			value, err := p.date(body)
+			return value, valueWeight, err
 		}
 	case 0x4:
-		length, start, err := p.length(body, info)
+		length, start, err := p.length(body, detail)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		data, err := p.bytes(start, length)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
-		return bytes.Clone(data), nil
+		return bytes.Clone(data), valueWeight + length, nil
 	case 0x5:
-		length, start, err := p.length(body, info)
+		length, start, err := p.length(body, detail)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		data, err := p.bytes(start, length)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
-		return latin1(data), nil
+		text := latin1(data)
+		return text, valueWeight + uint64(len(text)), nil
 	case 0x6:
-		length, start, err := p.length(body, info)
+		length, start, err := p.length(body, detail)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if length > uint64(len(p.data))/2 {
-			return nil, fmt.Errorf("%w: string of %d code units", errPlist, length)
+			return nil, 0, fmt.Errorf("%w: string of %d code units", errPlist, length)
 		}
 		data, err := p.bytes(start, length*2)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		units := make([]uint16, length)
 		for unit := range units {
 			units[unit] = binary.BigEndian.Uint16(data[unit*2:])
 		}
-		return string(utf16.Decode(units)), nil
+		text := string(utf16.Decode(units))
+		return text, valueWeight + uint64(len(text)), nil
 	case 0xA:
-		p.visiting[index] = true
-		defer func() { p.visiting[index] = false }()
-		return p.array(body, info, depth)
+		return p.array(body, detail, depth)
 	case 0xD:
-		p.visiting[index] = true
-		defer func() { p.visiting[index] = false }()
-		return p.dictionary(body, info, depth)
+		return p.dictionary(body, detail, depth)
 	}
-	return nil, fmt.Errorf("%w: unsupported marker 0x%02x", errPlist, marker)
+	return nil, 0, fmt.Errorf("%w: unsupported marker 0x%02x", errPlist, marker)
 }
 
 func (p *binaryPlist) bytes(start uint64, length uint64) ([]byte, error) {
@@ -197,9 +248,9 @@ func (p *binaryPlist) bytes(start uint64, length uint64) ([]byte, error) {
 	return p.data[start : start+length], nil
 }
 
-func (p *binaryPlist) length(body uint64, info byte) (uint64, uint64, error) {
-	if info != 0x0F {
-		return uint64(info), body, nil
+func (p *binaryPlist) length(body uint64, detail byte) (uint64, uint64, error) {
+	if detail != 0x0F {
+		return uint64(detail), body, nil
 	}
 	header, err := p.bytes(body, 1)
 	if err != nil {
@@ -216,11 +267,11 @@ func (p *binaryPlist) length(body uint64, info byte) (uint64, uint64, error) {
 	return readUnsigned(data), body + 1 + size, nil
 }
 
-func (p *binaryPlist) integer(start uint64, info byte) (any, error) {
-	if info > 4 {
-		return nil, fmt.Errorf("%w: integer of 2^%d bytes", errPlist, info)
+func (p *binaryPlist) integer(start uint64, detail byte) (any, error) {
+	if detail > 4 {
+		return nil, fmt.Errorf("%w: integer of 2^%d bytes", errPlist, detail)
 	}
-	data, err := p.bytes(start, uint64(1)<<info)
+	data, err := p.bytes(start, uint64(1)<<detail)
 	if err != nil {
 		return nil, err
 	}
@@ -242,8 +293,8 @@ func (p *binaryPlist) integer(start uint64, info byte) (any, error) {
 	return nil, fmt.Errorf("%w: integer exceeds 64 bits", errPlist)
 }
 
-func (p *binaryPlist) real(start uint64, info byte) (any, error) {
-	switch info {
+func (p *binaryPlist) real(start uint64, detail byte) (any, error) {
+	switch detail {
 	case 2:
 		data, err := p.bytes(start, 4)
 		if err != nil {
@@ -257,7 +308,7 @@ func (p *binaryPlist) real(start uint64, info byte) (any, error) {
 		}
 		return math.Float64frombits(binary.BigEndian.Uint64(data)), nil
 	}
-	return nil, fmt.Errorf("%w: real of 2^%d bytes", errPlist, info)
+	return nil, fmt.Errorf("%w: real of 2^%d bytes", errPlist, detail)
 }
 
 func (p *binaryPlist) date(start uint64) (any, error) {
@@ -273,8 +324,8 @@ func (p *binaryPlist) date(start uint64) (any, error) {
 	return time.Unix(referenceUnix+int64(whole), int64(fraction*1e9)).UTC(), nil
 }
 
-func (p *binaryPlist) references(body uint64, info byte, multiple uint64) ([]uint64, error) {
-	count, start, err := p.length(body, info)
+func (p *binaryPlist) references(body uint64, detail byte, multiple uint64) ([]uint64, error) {
+	count, start, err := p.length(body, detail)
 	if err != nil {
 		return nil, err
 	}
@@ -294,44 +345,58 @@ func (p *binaryPlist) references(body uint64, info byte, multiple uint64) ([]uin
 	return references, nil
 }
 
-func (p *binaryPlist) array(body uint64, info byte, depth int) (any, error) {
-	references, err := p.references(body, info, 1)
+func (p *binaryPlist) array(body uint64, detail byte, depth int) (any, uint64, error) {
+	references, err := p.references(body, detail, 1)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
+	}
+	weight := valueWeight * uint64(1+len(references))
+	if err := p.spend(weight); err != nil {
+		return nil, 0, err
 	}
 	array := make([]any, len(references))
 	for index, reference := range references {
-		if array[index], err = p.object(reference, depth+1); err != nil {
-			return nil, err
+		value, element, err := p.object(reference, depth+1)
+		if err != nil {
+			return nil, 0, err
 		}
+		array[index] = value
+		weight += element
 	}
-	return array, nil
+	return array, weight, nil
 }
 
-func (p *binaryPlist) dictionary(body uint64, info byte, depth int) (any, error) {
-	references, err := p.references(body, info, 2)
+func (p *binaryPlist) dictionary(body uint64, detail byte, depth int) (any, uint64, error) {
+	references, err := p.references(body, detail, 2)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	count := len(references) / 2
+	weight := valueWeight * uint64(1+len(references))
+	if err := p.spend(weight); err != nil {
+		return nil, 0, err
+	}
 	dictionary := make(map[string]any, count)
 	for index := range count {
-		key, err := p.object(references[index], depth+1)
+		key, keyWeight, err := p.object(references[index], depth+1)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		name, ok := key.(string)
 		if !ok {
-			return nil, fmt.Errorf("%w: dictionary key is %T", errPlist, key)
+			return nil, 0, fmt.Errorf("%w: dictionary key is %T", errPlist, key)
 		}
 		if _, duplicate := dictionary[name]; duplicate {
-			return nil, fmt.Errorf("%w: duplicate key %q", errPlist, name)
+			return nil, 0, fmt.Errorf("%w: duplicate key %q", errPlist, name)
 		}
-		if dictionary[name], err = p.object(references[count+index], depth+1); err != nil {
-			return nil, err
+		value, valueWeight, err := p.object(references[count+index], depth+1)
+		if err != nil {
+			return nil, 0, err
 		}
+		dictionary[name] = value
+		weight += keyWeight + valueWeight
 	}
-	return dictionary, nil
+	return dictionary, weight, nil
 }
 
 func latin1(data []byte) string {

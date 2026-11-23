@@ -326,3 +326,99 @@ func TestReporterWriterSplitsLines(t *testing.T) {
 		}
 	}
 }
+
+func TestReporterTruncatesPastTheLogLimit(t *testing.T) {
+	server := newFake(t)
+	server.handle("POST "+leasePath+"/events", eventsHandler)
+	reporter := NewReporter(server.session(t), time.Hour)
+	reporter.limit = 10
+
+	for _, line := range []string{"12345", "67890", "abc", "more"} {
+		reporter.Log(StreamStdout, line)
+	}
+	if err := reporter.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	events := receivedEvents(t, server)
+	if len(events) != 2 || strings.Join(events[0].Lines, ",") != "12345,67890" {
+		t.Fatalf("events = %+v, want the lines under the limit, then one truncation line", events)
+	}
+	if events[1].Stream != StreamStderr || len(events[1].Lines) != 1 || !strings.Contains(events[1].Lines[0], "output truncated") {
+		t.Errorf("truncation event = %+v", events[1])
+	}
+}
+
+// logLines writes count lines of MaxLineBytes each on its own goroutine and reports how many Log accepted.
+func logLines(reporter *Reporter, count int) (*atomic.Int32, chan struct{}) {
+	var written atomic.Int32
+	done := make(chan struct{})
+	line := strings.Repeat("x", MaxLineBytes)
+	go func() {
+		defer close(done)
+		for range count {
+			reporter.Log(StreamStdout, line)
+			written.Add(1)
+		}
+	}()
+	return &written, done
+}
+
+func TestReporterBlocksWritersWhileTheBacklogIsFull(t *testing.T) {
+	server := newFake(t)
+	release := make(chan struct{})
+	server.handle("POST "+leasePath+"/events", func(writer http.ResponseWriter, _ *http.Request) {
+		<-release
+		writer.WriteHeader(http.StatusNoContent)
+	})
+	reporter := NewReporter(server.session(t), time.Hour)
+	lines := 2 * backlogBytes / MaxLineBytes
+
+	written, done := logLines(reporter, lines)
+	time.Sleep(300 * time.Millisecond)
+	stalled := written.Load()
+	if int(stalled) >= lines {
+		t.Fatalf("all %d lines were queued while the server held the first batch", lines)
+	}
+	if queued := int(stalled) * MaxLineBytes; queued > 2*backlogBytes {
+		t.Fatalf("%d bytes were queued, want the backlog to stop the writer near %d", queued, backlogBytes)
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the writer stayed blocked after the server answered")
+	}
+	if err := reporter.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	delivered := 0
+	for _, event := range receivedEvents(t, server) {
+		delivered += len(event.Lines)
+	}
+	if delivered != lines {
+		t.Errorf("delivered %d lines, want %d", delivered, lines)
+	}
+}
+
+func TestReporterCloseReleasesABlockedWriter(t *testing.T) {
+	server := newFake(t)
+	server.handle("POST "+leasePath+"/events", func(writer http.ResponseWriter, _ *http.Request) {
+		respond(t, writer, http.StatusServiceUnavailable, nil)
+	})
+	session := server.session(t)
+	session.client.retry = retry{attempts: 1, backoff: time.Millisecond, ceiling: time.Millisecond}
+	reporter := NewReporter(session, time.Hour)
+
+	_, done := logLines(reporter, 2*backlogBytes/MaxLineBytes)
+	time.Sleep(200 * time.Millisecond)
+	closing, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = reporter.Close(closing)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close left the writer blocked")
+	}
+}

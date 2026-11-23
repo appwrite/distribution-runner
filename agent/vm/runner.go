@@ -10,13 +10,14 @@ import (
 
 // Process is one host program started from an argv, never through a shell.
 type Process struct {
-	Path string
-	Args []string
-	// Env is appended to the agent's own environment.
-	Env    []string
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+	Path      string
+	Arguments []string
+	// Environment is added to a minimal one: PATH, HOME and TMPDIR from the agent's own, and lume telemetry off.
+	// Nothing else the agent was started with, such as its enrolment secret, reaches a child.
+	Environment []string
+	Stdin       io.Reader
+	Stdout      io.Writer
+	Stderr      io.Writer
 }
 
 // Runner starts host processes. Lume uses System; tests inject a recorder.
@@ -35,9 +36,11 @@ type System struct{}
 
 const pipeDelay = 5 * time.Second
 
+var inherited = []string{"PATH", "HOME", "TMPDIR"}
+
 func (System) Start(process Process) (Handle, error) {
-	command := exec.Command(process.Path, process.Args...)
-	command.Env = append(os.Environ(), process.Env...)
+	command := exec.Command(process.Path, process.Arguments...)
+	command.Env = append(minimalEnvironment(), process.Environment...)
 	command.Stdin = process.Stdin
 	command.Stdout = process.Stdout
 	command.Stderr = process.Stderr
@@ -46,6 +49,16 @@ func (System) Start(process Process) (Handle, error) {
 		return nil, err
 	}
 	return &systemHandle{command: command}, nil
+}
+
+func minimalEnvironment() []string {
+	environment := []string{telemetry}
+	for _, name := range inherited {
+		if value, ok := os.LookupEnv(name); ok {
+			environment = append(environment, name+"="+value)
+		}
+	}
+	return environment
 }
 
 type systemHandle struct {

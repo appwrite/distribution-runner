@@ -16,22 +16,33 @@ const (
 	entitlementsMagic     = 0xFADE7171
 	requirementsMagic     = 0xFADE0C01
 	signatureWrapperMagic = 0xFADE0B01
+	signatureWrapperSlot  = 0x10000
+	fatMagic              = 0xCAFEBABE
 	adHocFlag             = 0x2
 	teamVersion           = 0x20200
 	codeDirectoryHeader   = 44
 	teamOffsetPosition    = 48
 )
 
-// signature is what one Mach-O slice's embedded code signature declares.
+// signature is what one Mach-O slice's embedded code signature declares. cms is a non-empty CMS signature blob,
+// which every signature but an ad hoc one carries.
 type signature struct {
 	present      bool
 	adHoc        bool
+	cms          bool
 	team         string
 	entitlements []byte
 }
 
-// signatures reads the code signature of every slice of a thin or universal Mach-O executable.
-func signatures(reader io.ReaderAt, size int64, limit int64) ([]signature, error) {
+// signatures reads the code signature of every slice of a thin or universal Mach-O executable, refusing a universal
+// binary of more than architectures slices before debug/macho parses each one.
+func signatures(reader io.ReaderAt, size int64, limit int64, architectures uint32) ([]signature, error) {
+	header := make([]byte, 8)
+	if _, err := reader.ReadAt(header, 0); err == nil && binary.BigEndian.Uint32(header) == fatMagic {
+		if count := binary.BigEndian.Uint32(header[4:]); count > architectures {
+			return nil, fmt.Errorf("universal binary declares %d slices, limit %d", count, architectures)
+		}
+	}
 	fat, err := macho.NewFatFile(reader)
 	if errors.Is(err, macho.ErrNotFat) {
 		file, err := macho.NewFile(io.NewSectionReader(reader, 0, size))
@@ -122,6 +133,7 @@ func superBlob(data []byte) (signature, error) {
 		if size < 8 || size > length-offset {
 			return signature{}, errors.New("superblob entry length does not fit")
 		}
+		slot := binary.BigEndian.Uint32(data[12+index*8:])
 		blob := data[offset : offset+size]
 		switch binary.BigEndian.Uint32(blob) {
 		case codeDirectoryMagic:
@@ -140,6 +152,8 @@ func superBlob(data []byte) (signature, error) {
 				return signature{}, errors.New("more than one entitlements blob")
 			}
 			found.entitlements = blob[8:]
+		case signatureWrapperMagic:
+			found.cms = found.cms || (slot == signatureWrapperSlot && size > 8)
 		}
 	}
 	if directories == 0 {

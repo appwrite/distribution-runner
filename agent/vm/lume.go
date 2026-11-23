@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/netip"
 	"os"
 	"path"
@@ -21,10 +22,14 @@ import (
 // through the system ssh and scp with a key. Every host process is an argv; nothing runs through a host shell, and
 // command arguments and environment travel on ssh's standard input, never in an argv.
 //
+// Every machine gets its own ssh host key: the agent mints it, shares it read-only into that machine alone with
+// `lume run --shared-dir`, and pins it, so one guest cannot answer for another with a key the golden image shares.
+// The golden image installs the key before sshd answers with it (vm/README.md, host keys).
+//
 // Unproven pending spike S7: no build has run through this adapter on a real Mac yet. The commands and flags are
-// taken from the lume-v0.7.2 sources (clone, run --display none --vnc disabled, get --format json,
-// stop --force, delete --force, ls --format json); the boot timing, address discovery on vmnet NAT and two
-// concurrent clones per host are not yet measured.
+// taken from the lume-v0.7.2 sources (clone, run --display none --vnc disabled --shared-dir, get --format json,
+// stop --force, delete --force, ls --format json); the boot timing, address discovery on vmnet NAT, the guest
+// picking up its host key and two concurrent clones per host are not yet measured.
 type Lume struct {
 	// Golden is the stopped VM every machine is cloned from.
 	Golden string
@@ -37,10 +42,6 @@ type Lume struct {
 	User string
 	// Key is the private key the guest account authorises.
 	Key string
-	// KnownHosts pins the golden image's host key, which every clone shares, recorded under Alias (Golden by
-	// default). Empty trusts the first key each machine presents, kept in a per-machine file.
-	KnownHosts string
-	Alias      string
 	// Boot bounds waiting for an address and a working ssh login, 5 minutes by default; Poll is the interval
 	// between attempts, 2 seconds by default.
 	Boot time.Duration
@@ -67,7 +68,17 @@ const (
 	telemetry      = "LUME_TELEMETRY_ENABLED=false"
 	statusRunning  = "running"
 	prepareExists  = 3
+	notFile        = 4
+	// machinePrefix names a machine's host directory, followed by the machine name and a random suffix.
+	machinePrefix = "vm-"
+	// Share is the directory lume shares read-only into the guest, which sees it as
+	// /Volumes/My Shared Files/host-key. HostKeyFile is the private key in it.
+	Share       = "host-key"
+	HostKeyFile = "ssh_host_ed25519_key"
+	knownHosts  = "known_hosts"
 )
+
+var errAddress = errors.New("vm: lume reported an invalid address")
 
 type instance struct {
 	name      string
@@ -99,9 +110,12 @@ func (l *Lume) Create(ctx context.Context, name string) (Machine, error) {
 		return Machine{}, err
 	}
 
-	directory, err := os.MkdirTemp(l.Directory, "vm-"+name+"-")
-	if err == nil && unsafeOption(directory) {
-		err = fmt.Errorf("vm: temporary directory %q is not usable in an ssh option", directory)
+	directory, err := os.MkdirTemp(l.Directory, machinePrefix+name+"-")
+	if err == nil && (unsafeOption(directory) || strings.Contains(directory, ":")) {
+		err = fmt.Errorf("vm: temporary directory %q is not usable in an ssh option or a lume share", directory)
+	}
+	if err == nil {
+		err = writeHostKey(directory, name)
 	}
 	if err != nil {
 		l.release(name)
@@ -112,13 +126,17 @@ func (l *Lume) Create(ctx context.Context, name string) (Machine, error) {
 	}
 	created.directory = directory
 
-	if _, err := l.lume(ctx, "clone", l.Golden, name); err != nil {
+	present, err := l.present(ctx, name)
+	if err == nil && present {
+		err = fmt.Errorf("%w: lume already has %s", ErrExists, name)
+	}
+	if err != nil {
 		l.release(name)
 		_ = os.RemoveAll(directory)
 		return Machine{}, err
 	}
 
-	machine, err := l.start(ctx, created)
+	machine, err := l.clone(ctx, created)
 	if err != nil {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), destroyTimeout)
 		defer cancel()
@@ -130,11 +148,46 @@ func (l *Lume) Create(ctx context.Context, name string) (Machine, error) {
 	return machine, nil
 }
 
+// clone copies the golden image and boots the copy. Its caller destroys whatever a failure leaves, a partial clone
+// included, since lume names the machine before the copy finishes.
+func (l *Lume) clone(ctx context.Context, created *instance) (Machine, error) {
+	if _, err := l.lume(ctx, "clone", l.Golden, created.name); err != nil {
+		return Machine{}, err
+	}
+	machine, err := l.start(ctx, created)
+	if err != nil {
+		return Machine{}, err
+	}
+	if err := os.RemoveAll(filepath.Join(created.directory, Share)); err != nil {
+		return Machine{}, err
+	}
+	return machine, nil
+}
+
+// writeHostKey mints the machine's host key into its share and pins it, under the machine's name, in known_hosts.
+func writeHostKey(directory string, name string) error {
+	key, err := newHostKey(name)
+	if err != nil {
+		return err
+	}
+	share := filepath.Join(directory, Share)
+	if err := os.Mkdir(share, 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(share, HostKeyFile), key.Private, 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(share, HostKeyFile+".pub"), []byte(key.Public+" "+name+"\n"), 0o600); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(directory, knownHosts), []byte(name+" "+key.Public+"\n"), 0o600)
+}
+
 func (l *Lume) Exec(ctx context.Context, machine Machine, command Command) (int, error) {
-	if err := validateArgs(command.Args); err != nil {
+	if err := validateArguments(command.Arguments); err != nil {
 		return -1, err
 	}
-	if err := validateEnvironment(command.Env); err != nil {
+	if err := validateEnvironment(command.Environment); err != nil {
 		return -1, err
 	}
 	running, err := l.lookup(machine)
@@ -143,11 +196,11 @@ func (l *Lume) Exec(ctx context.Context, machine Machine, command Command) (int,
 	}
 	group := "/tmp/distribution-" + rand.Text() + ".pgid"
 	handle, err := l.runner().Start(Process{
-		Path:   l.sshBinary(),
-		Args:   l.sshArgs(running),
-		Stdin:  strings.NewReader(execScript(group, command.Env, command.Args)),
-		Stdout: command.Stdout,
-		Stderr: command.Stderr,
+		Path:      l.sshBinary(),
+		Arguments: l.sshArguments(running),
+		Stdin:     strings.NewReader(execScript(group, command.Environment, command.Arguments)),
+		Stdout:    command.Stdout,
+		Stderr:    command.Stderr,
 	})
 	if err != nil {
 		return -1, err
@@ -205,6 +258,11 @@ func (l *Lume) Destroy(ctx context.Context, machine Machine) error {
 	if err != nil {
 		return err
 	}
+	if running == nil {
+		if err := l.removeDirectories(machine.Name); err != nil {
+			return err
+		}
+	}
 	if code == 0 {
 		return nil
 	}
@@ -218,13 +276,86 @@ func (l *Lume) Destroy(ctx context.Context, machine Machine) error {
 	return fmt.Errorf("vm: lume delete %s exited %d: %s", machine.Name, code, stderr)
 }
 
+// Sweep deletes every lume machine named with prefix that this Lume does not own, and every per-machine directory
+// of such a machine.
+func (l *Lume) Sweep(ctx context.Context, prefix string) error {
+	if err := validateName(prefix); err != nil {
+		return err
+	}
+	listed, err := l.list(ctx)
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, entry := range listed {
+		if !strings.HasPrefix(entry.Name, prefix) || l.owned(entry.Name) {
+			continue
+		}
+		if err := l.Destroy(ctx, Machine{Name: entry.Name}); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	entries, err := os.ReadDir(l.directory())
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		failures = append(failures, err)
+	}
+	for _, entry := range entries {
+		name, ok := strings.CutPrefix(entry.Name(), machinePrefix)
+		if !ok || !strings.HasPrefix(name, prefix) || l.ownedDirectory(entry.Name()) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(l.directory(), entry.Name())); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (l *Lume) owned(name string) bool {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+	_, ok := l.machines[name]
+	return ok
+}
+
+func (l *Lume) ownedDirectory(base string) bool {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+	for _, running := range l.machines {
+		if filepath.Base(running.directory) == base {
+			return true
+		}
+	}
+	return false
+}
+
+// removeDirectories removes the per-machine directories of a machine this Lume no longer tracks.
+func (l *Lume) removeDirectories(name string) error {
+	matches, err := filepath.Glob(filepath.Join(l.directory(), machinePrefix+name+"-*"))
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, match := range matches {
+		if suffix := strings.TrimPrefix(filepath.Base(match), machinePrefix+name+"-"); strings.Contains(suffix, "-") {
+			continue
+		}
+		failures = append(failures, os.RemoveAll(match))
+	}
+	return errors.Join(failures...)
+}
+
+func (l *Lume) directory() string {
+	return fallback(l.Directory, os.TempDir())
+}
+
 func (l *Lume) start(ctx context.Context, created *instance) (Machine, error) {
 	handle, err := l.runner().Start(Process{
-		Path:   l.lumeBinary(),
-		Args:   []string{"run", created.name, "--display", "none", "--vnc", "disabled"},
-		Env:    []string{telemetry},
-		Stdout: created.log,
-		Stderr: created.log,
+		Path:        l.lumeBinary(),
+		Arguments:   []string{"run", created.name, "--display", "none", "--vnc", "disabled", "--shared-dir", filepath.Join(created.directory, Share) + ":ro"},
+		Environment: []string{telemetry},
+		Stdout:      created.log,
+		Stderr:      created.log,
 	})
 	if err != nil {
 		close(created.exited)
@@ -246,8 +377,11 @@ func (l *Lume) start(ctx context.Context, created *instance) (Machine, error) {
 			return Machine{}, err
 		}
 		address, err := l.address(ctx, created.name)
-		if err != nil && ctx.Err() == nil {
+		if errors.Is(err, errAddress) {
 			return Machine{}, err
+		}
+		if err != nil && ctx.Err() == nil {
+			last = err
 		}
 		if address != "" {
 			l.mutex.Lock()
@@ -269,7 +403,8 @@ func (l *Lume) start(ctx context.Context, created *instance) (Machine, error) {
 	}
 }
 
-// address returns the guest IP once lume reports the machine running with ssh reachable, and "" before that.
+// address returns the guest IP once lume reports the machine running with ssh reachable, and "" before that. A failed
+// listing is worth retrying; an invalid address is not.
 func (l *Lume) address(ctx context.Context, name string) (string, error) {
 	output, err := l.lume(ctx, "get", name, "--format", "json")
 	if err != nil {
@@ -289,7 +424,7 @@ func (l *Lume) address(ctx context.Context, name string) (string, error) {
 		}
 		address, err := netip.ParseAddr(*entry.IPAddress)
 		if err != nil || address.Zone() != "" || address.IsUnspecified() || address.IsMulticast() {
-			return "", fmt.Errorf("vm: lume reported an invalid address %q for %s", *entry.IPAddress, name)
+			return "", fmt.Errorf("%w %q for %s", errAddress, *entry.IPAddress, name)
 		}
 		return address.String(), nil
 	}
@@ -335,24 +470,48 @@ func (l *Lume) copyIn(ctx context.Context, running *instance, home string, trans
 	return l.scp(ctx, running, source, remote(running.address, destination))
 }
 
-func (l *Lume) copyOut(ctx context.Context, running *instance, home string, transfer Transfer) error {
-	destination, err := filepath.Abs(transfer.Destination)
+// copyOut streams one regular guest file through "cat" into a new private host file, stopping at the limit, so a
+// guest cannot fill the host with a huge or endless file, a device or a directory tree.
+func (l *Lume) copyOut(ctx context.Context, running *instance, home string, transfer Transfer) (err error) {
+	source := guestPath(home, transfer.Source)
+	file, err := createExclusive(transfer.Destination)
 	if err != nil {
 		return err
 	}
-	if information, err := os.Stat(destination); err == nil && information.IsDir() {
-		return fmt.Errorf("%w: %s", ErrDestination, destination)
-	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+	limited := &limitWriter{writer: file, limit: transfer.Limit}
+	defer func() {
+		if closeErr := file.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			_ = os.Remove(transfer.Destination)
+		}
+	}()
+	stderr := &tail{limit: logBytes}
+	code, err := l.run(ctx, Process{
+		Path:      l.sshBinary(),
+		Arguments: l.sshArguments(running),
+		Stdin:     strings.NewReader(readScript(source)),
+		Stdout:    limited,
+		Stderr:    stderr,
+	})
+	switch {
+	case limited.over:
+		return fmt.Errorf("%w: %s exceeds %d bytes", ErrLimit, source, transfer.Limit)
+	case err != nil:
 		return err
+	case code == notFile:
+		return fmt.Errorf("%w: %s", ErrNotFile, source)
+	case code != 0:
+		return fmt.Errorf("vm: reading %s exited %d: %s", source, code, strings.TrimSpace(stderr.String()))
 	}
-	return l.scp(ctx, running, remote(running.address, guestPath(home, transfer.Source)), destination)
+	return nil
 }
 
 func (l *Lume) scp(ctx context.Context, running *instance, source string, destination string) error {
 	stderr := &tail{limit: logBytes}
 	arguments := append(l.options(running), "-q", "-p", "-r", "--", source, destination)
-	code, err := l.run(ctx, Process{Path: l.scpBinary(), Args: arguments, Stderr: stderr})
+	code, err := l.run(ctx, Process{Path: l.scpBinary(), Arguments: arguments, Stderr: stderr})
 	if err != nil {
 		return err
 	}
@@ -365,20 +524,21 @@ func (l *Lume) scp(ctx context.Context, running *instance, source string, destin
 // shell runs a fixed guest script through ssh, with the script on standard input.
 func (l *Lume) shell(ctx context.Context, running *instance, script string, stdout io.Writer) (int, error) {
 	return l.run(ctx, Process{
-		Path:   l.sshBinary(),
-		Args:   l.sshArgs(running),
-		Stdin:  strings.NewReader(script),
-		Stdout: stdout,
-		Stderr: io.Discard,
+		Path:      l.sshBinary(),
+		Arguments: l.sshArguments(running),
+		Stdin:     strings.NewReader(script),
+		Stdout:    stdout,
+		Stderr:    io.Discard,
 	})
 }
 
-func (l *Lume) sshArgs(running *instance) []string {
+func (l *Lume) sshArguments(running *instance) []string {
 	return append(l.options(running), "-T", "--", running.address, shellCommand)
 }
 
 // options are shared by ssh and scp. "-F none" keeps the agent user's ssh configuration (ProxyCommand, Match exec,
-// control sockets) out of the connection, and only the configured key is offered.
+// control sockets) out of the connection, and only the configured key is offered. The machine's own host key is the
+// only one accepted.
 func (l *Lume) options(running *instance) []string {
 	options := []string{
 		"-F", "none",
@@ -400,18 +560,12 @@ func (l *Lume) options(running *instance) []string {
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=4",
 		"-o", "LogLevel=ERROR",
+		"-o", "StrictHostKeyChecking=yes",
+		"-o", "HostKeyAlgorithms=" + hostKeyType,
+		"-o", "UserKnownHostsFile=" + filepath.Join(running.directory, knownHosts),
+		"-o", "HostKeyAlias=" + running.name,
 	}
-	if l.KnownHosts != "" {
-		return append(options,
-			"-o", "StrictHostKeyChecking=yes",
-			"-o", "UserKnownHostsFile="+l.KnownHosts,
-			"-o", "HostKeyAlias="+l.alias(),
-		)
-	}
-	return append(options,
-		"-o", "StrictHostKeyChecking=accept-new",
-		"-o", "UserKnownHostsFile="+filepath.Join(running.directory, "known_hosts"),
-	)
+	return options
 }
 
 func (l *Lume) lume(ctx context.Context, arguments ...string) ([]byte, error) {
@@ -433,23 +587,19 @@ func (l *Lume) lumeResult(ctx context.Context, arguments ...string) (int, string
 func (l *Lume) lumeCapture(ctx context.Context, stdout io.Writer, arguments ...string) (int, string, error) {
 	stderr := &tail{limit: logBytes}
 	code, err := l.run(ctx, Process{
-		Path:   l.lumeBinary(),
-		Args:   arguments,
-		Env:    []string{telemetry},
-		Stdout: stdout,
-		Stderr: stderr,
+		Path:        l.lumeBinary(),
+		Arguments:   arguments,
+		Environment: []string{telemetry},
+		Stdout:      stdout,
+		Stderr:      stderr,
 	})
 	return code, strings.TrimSpace(stderr.String()), err
 }
 
 func (l *Lume) present(ctx context.Context, name string) (bool, error) {
-	output, err := l.lume(ctx, "ls", "--format", "json")
+	listed, err := l.list(ctx)
 	if err != nil {
 		return false, err
-	}
-	var listed []details
-	if err := json.Unmarshal(output, &listed); err != nil {
-		return false, fmt.Errorf("vm: lume ls: %w", err)
 	}
 	for _, entry := range listed {
 		if entry.Name == name {
@@ -457,6 +607,18 @@ func (l *Lume) present(ctx context.Context, name string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func (l *Lume) list(ctx context.Context) ([]details, error) {
+	output, err := l.lume(ctx, "ls", "--format", "json")
+	if err != nil {
+		return nil, err
+	}
+	var listed []details
+	if err := json.Unmarshal(output, &listed); err != nil {
+		return nil, fmt.Errorf("vm: lume ls: %w", err)
+	}
+	return listed, nil
 }
 
 // run starts a process and waits for it, killing it when ctx ends.
@@ -518,10 +680,8 @@ func (l *Lume) validate() error {
 	if l.Key == "" {
 		return errors.New("vm: an ssh key is required")
 	}
-	for _, value := range []string{l.Key, l.KnownHosts, l.alias()} {
-		if unsafeOption(value) {
-			return fmt.Errorf("vm: %q is not usable in an ssh option", value)
-		}
+	if unsafeOption(l.Key) {
+		return fmt.Errorf("vm: %q is not usable in an ssh option", l.Key)
 	}
 	return nil
 }
@@ -535,7 +695,6 @@ func (l *Lume) lumeBinary() string { return fallback(l.Binary, "lume") }
 func (l *Lume) sshBinary() string  { return fallback(l.SSH, "/usr/bin/ssh") }
 func (l *Lume) scpBinary() string  { return fallback(l.SCP, "/usr/bin/scp") }
 func (l *Lume) user() string       { return fallback(l.User, "lume") }
-func (l *Lume) alias() string      { return fallback(l.Alias, l.Golden) }
 
 func (l *Lume) boot() time.Duration  { return positive(l.Boot, defaultBoot) }
 func (l *Lume) poll() time.Duration  { return positive(l.Poll, defaultPoll) }

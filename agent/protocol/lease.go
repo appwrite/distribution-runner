@@ -9,10 +9,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"sync"
 	"time"
 )
 
+// Lease is a claimed build. Claim moves ExpiresAt onto the host clock.
 type Lease struct {
 	LeaseID     string      `json:"leaseId"`
 	Token       string      `json:"token"`
@@ -166,11 +168,19 @@ func (c *Client) Session(credentials Credentials, lease Lease) (*Session, error)
 	}, nil
 }
 
-// Extend renews the lease. The build must stop when the result says it was canceled.
+// Extend renews the lease. The build must stop when the result says it was canceled. ExpiresAt is on the host clock.
 func (s *Session) Extend(ctx context.Context) (Extension, error) {
+	response, err := s.client.send(ctx, jsonCall(s.call(http.MethodPatch, ""), []byte("{}")))
+	if err != nil {
+		return Extension{}, err
+	}
+	defer discard(response)
 	var extension Extension
-	err := s.client.sendJSON(ctx, s.call(http.MethodPatch, ""), struct{}{}, &extension)
-	return extension, err
+	if err := json.NewDecoder(response.Body).Decode(&extension); err != nil {
+		return Extension{}, fmt.Errorf("distribution: decode response: %w", err)
+	}
+	extension.ExpiresAt = hostTime(extension.ExpiresAt, response.Header)
+	return extension, nil
 }
 
 // Source asks for a fresh download descriptor; ask again after a failed download, because the URL expires within minutes.
@@ -223,10 +233,8 @@ func queryHeaders(query map[string]string) (http.Header, error) {
 			return nil, fmt.Errorf("distribution: lease query key %q is not a valid header suffix", key)
 		}
 		name := http.CanonicalHeaderKey("X-Appwrite-" + key)
-		for _, forbidden := range forbiddenHeaders {
-			if name == forbidden {
-				return nil, fmt.Errorf("distribution: lease query key %q maps to forbidden header %s", key, name)
-			}
+		if slices.Contains(forbiddenHeaders, name) || slices.Contains(reservedHeaders, name) {
+			return nil, fmt.Errorf("distribution: lease query key %q maps to forbidden header %s", key, name)
 		}
 		headers.Set(name, value)
 	}

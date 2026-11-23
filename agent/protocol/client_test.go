@@ -253,6 +253,7 @@ func TestClaimCreated(t *testing.T) {
 		base64.StdEncoding.EncodeToString(certificate), base64.StdEncoding.EncodeToString(profile))
 	server.handle("POST /v1/distribution/runners/"+testRunnerID+"/leases", func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
+		writer.Header().Set("Date", "Mon, 23 Nov 2026 10:00:00 GMT")
 		writer.WriteHeader(http.StatusCreated)
 		_, _ = writer.Write([]byte(body))
 	})
@@ -265,8 +266,8 @@ func TestClaimCreated(t *testing.T) {
 	if lease.LeaseID != testLeaseID || lease.Token != testLeaseToken || lease.BuildID != "build1" || lease.Attempt != 2 || lease.Timeout != 3600 {
 		t.Errorf("lease = %+v", *lease)
 	}
-	if !lease.ExpiresAt.Equal(time.Date(2026, 11, 23, 10, 5, 0, 0, time.UTC)) {
-		t.Errorf("ExpiresAt = %v", lease.ExpiresAt)
+	if remaining := time.Until(lease.ExpiresAt); remaining < 4*time.Minute || remaining > 5*time.Minute {
+		t.Errorf("ExpiresAt is %v away, want the 5 minutes the server's own clock gives", remaining)
 	}
 	if lease.Query["project"] != testProject || lease.Query["environment"] != testRegion {
 		t.Errorf("Query = %v", lease.Query)
@@ -373,5 +374,68 @@ func TestCredentialsMarshalForState(t *testing.T) {
 	}
 	if string(encoded) != `{"runnerId":"runner1","token":"runner-token-sentinel"}` {
 		t.Errorf("encoded = %s", encoded)
+	}
+}
+
+func TestHostTimeKeepsTimestampsWithoutDate(t *testing.T) {
+	at := time.Date(2026, 11, 23, 10, 5, 0, 0, time.UTC)
+	if got := hostTime(at, http.Header{}); !got.Equal(at) {
+		t.Errorf("hostTime without Date = %v, want %v", got, at)
+	}
+	if got := hostTime(at, http.Header{"Date": {"not a date"}}); !got.Equal(at) {
+		t.Errorf("hostTime with an invalid Date = %v, want %v", got, at)
+	}
+}
+
+func TestResponseErrorPermanent(t *testing.T) {
+	for status, permanent := range map[int]bool{
+		http.StatusBadRequest:          true,
+		http.StatusUnauthorized:        true,
+		http.StatusNotFound:            true,
+		http.StatusConflict:            true,
+		http.StatusRequestTimeout:      false,
+		http.StatusTooManyRequests:     false,
+		http.StatusInternalServerError: false,
+		http.StatusServiceUnavailable:  false,
+	} {
+		if got := (&ResponseError{Status: status}).Permanent(); got != permanent {
+			t.Errorf("Permanent() for %d = %v, want %v", status, got, permanent)
+		}
+	}
+}
+
+func TestAttemptTimesOutASilentServer(t *testing.T) {
+	release := make(chan struct{})
+	server := newFake(t)
+	server.handle("POST /v1/distribution/runners/"+testRunnerID+"/leases", func(http.ResponseWriter, *http.Request) {
+		<-release
+	})
+	t.Cleanup(func() { close(release) })
+	client := server.client(t)
+
+	started := time.Now()
+	_, err := client.send(context.Background(), call{
+		method:  http.MethodPost,
+		url:     client.endpoint + "/distribution/runners/" + testRunnerID + "/leases",
+		token:   testRunnerKey,
+		timeout: 50 * time.Millisecond,
+	})
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("send = %v, want the attempt deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("send took %v", elapsed)
+	}
+}
+
+func TestDefaultTransportBoundsResponseHeaders(t *testing.T) {
+	client, err := New("https://cloud.example/v1", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := client.http.Transport.(*http.Transport)
+	if !ok || transport.ResponseHeaderTimeout != UploadTimeout {
+		t.Fatalf("transport = %#v, want a response header timeout of %v", client.http.Transport, UploadTimeout)
 	}
 }

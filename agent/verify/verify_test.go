@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -171,7 +172,7 @@ func TestSampleVerifies(t *testing.T) {
 			}
 			digest := sha256.Sum256(data)
 
-			result, err := IPA(path, testExpected())
+			result, err := IPA(path, testExpected(), t.TempDir())
 			if err != nil {
 				t.Fatalf("verify: %v", err)
 			}
@@ -283,6 +284,7 @@ func TestMismatch(t *testing.T) {
 		{name: "ad hoc", spec: func(spec *Spec) { spec.AdHoc = true }, errors: []error{ErrUnsigned, ErrTeam}},
 		{name: "universal ad hoc", spec: func(spec *Spec) { spec.AdHoc, spec.Universal = true, true }, errors: []error{ErrUnsigned, ErrTeam}},
 		{name: "no code signature", spec: func(spec *Spec) { spec.Unsigned = true }, errors: []error{ErrUnsigned, ErrTeam}},
+		{name: "no cms signature", spec: func(spec *Spec) { spec.EmptyCMS = true }, errors: []error{ErrUnsigned}},
 		{name: "signed without a team", spec: func(spec *Spec) { spec.TeamID = "" }, errors: []error{ErrTeam}, signed: true},
 		{
 			name:   "every mismatch at once",
@@ -300,7 +302,7 @@ func TestMismatch(t *testing.T) {
 			if test.expected != nil {
 				test.expected(&expected)
 			}
-			result, err := IPA(writeSample(t, spec), expected)
+			result, err := IPA(writeSample(t, spec), expected, t.TempDir())
 			assertErrors(t, err, test.errors...)
 			if result.Digest == "" || result.Size == 0 {
 				t.Fatal("result has no digest or size")
@@ -338,24 +340,40 @@ func TestUniversalSlicesMustAgree(t *testing.T) {
 				{target: amd64, data: machOSlice(amd64, test.second, sealed{entitlements: entitlements})},
 			})
 			path := rewrite(t, writeSample(t, testSpec()), named(sampleRoot+sampleName), sampleEntry{name: sampleRoot + sampleName, data: executable})
-			_, err := IPA(path, testExpected())
+			_, err := IPA(path, testExpected(), t.TempDir())
 			assertErrors(t, err, test.errors...)
 		})
 	}
 }
 
 func TestNestedProfiles(t *testing.T) {
+	widgetInfo := func(identifier string) []byte {
+		data, err := encodeBinary(map[string]any{"CFBundleIdentifier": identifier})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
 	cases := map[string]struct {
 		profile []byte
+		info    []byte
 		errors  []error
 	}{
-		"profile from the lease":     {profile: widgetProfile},
-		"profile not from the lease": {profile: []byte("foreign"), errors: []error{ErrProfile}},
+		"profile from the lease":           {profile: widgetProfile, info: widgetInfo(testIdentifier + ".widget")},
+		"profile not from the lease":       {profile: []byte("foreign"), info: widgetInfo(testIdentifier + ".widget"), errors: []error{ErrProfile}},
+		"another bundle's profile":         {profile: testProfile, info: widgetInfo(testIdentifier + ".widget"), errors: []error{ErrProfile}},
+		"bundle the lease has no profile":  {profile: widgetProfile, info: widgetInfo(testIdentifier + ".other"), errors: []error{ErrProfile}},
+		"bundle without an Info.plist":     {profile: widgetProfile, errors: []error{ErrProfile}},
+		"bundle without a bundle identity": {profile: widgetProfile, info: widgetInfo(""), errors: []error{ErrProfile}},
 	}
 	for name, test := range cases {
 		t.Run(name, func(t *testing.T) {
-			path := rewrite(t, writeSample(t, testSpec()), nil, sampleEntry{name: widgetRoot + "embedded.mobileprovision", data: test.profile})
-			_, err := IPA(path, testExpected())
+			entries := []sampleEntry{{name: widgetRoot + "embedded.mobileprovision", data: test.profile}}
+			if test.info != nil {
+				entries = append(entries, sampleEntry{name: widgetRoot + "Info.plist", data: test.info})
+			}
+			path := rewrite(t, writeSample(t, testSpec()), nil, entries...)
+			_, err := IPA(path, testExpected(), t.TempDir())
 			if test.errors == nil {
 				if err != nil {
 					t.Fatalf("verify: %v", err)
@@ -401,7 +419,7 @@ func TestStoredExecutableIsReadInPlace(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := IPA(path, testExpected()); err != nil {
+	if _, err := IPA(path, testExpected(), t.TempDir()); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
 }
@@ -476,7 +494,7 @@ func TestMalformedBundle(t *testing.T) {
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			path := rewrite(t, writeSample(t, testSpec()), test.drop, test.entries...)
-			_, err := IPA(path, testExpected())
+			_, err := IPA(path, testExpected(), t.TempDir())
 			assertErrors(t, err, test.errors...)
 		})
 	}
@@ -525,7 +543,7 @@ func TestDamagedArchive(t *testing.T) {
 			if err := os.WriteFile(path, data, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			result, err := IPA(path, testExpected())
+			result, err := IPA(path, testExpected(), t.TempDir())
 			assertErrors(t, err, ErrArchive)
 			digest := sha256.Sum256(data)
 			if result.Digest != hex.EncodeToString(digest[:]) || result.Size != int64(len(data)) {
@@ -546,11 +564,11 @@ func TestEntryCeiling(t *testing.T) {
 
 	ceiling := defaults
 	ceiling.entries = count
-	if _, err := verify(path, testExpected(), ceiling); err != nil {
+	if _, err := verify(path, testExpected(), t.TempDir(), ceiling); err != nil {
 		t.Fatalf("an IPA at the entry ceiling failed: %v", err)
 	}
 	ceiling.entries = count - 1
-	_, err = verify(path, testExpected(), ceiling)
+	_, err = verify(path, testExpected(), t.TempDir(), ceiling)
 	assertErrors(t, err, ErrEntries)
 }
 
@@ -572,7 +590,7 @@ func TestDefaultEntryCeiling(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_, err = IPA(path, testExpected())
+	_, err = IPA(path, testExpected(), t.TempDir())
 	assertErrors(t, err, ErrEntries)
 }
 
@@ -592,7 +610,7 @@ func TestUncompressedSizeCeiling(t *testing.T) {
 		"sizes overflowing 64 bits":  declared(^uint64(0), ^uint64(0)),
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := IPA(path, testExpected())
+			_, err := IPA(path, testExpected(), t.TempDir())
 			assertErrors(t, err, ErrSize)
 		})
 	}
@@ -613,7 +631,7 @@ func TestEntryCeilings(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			ceiling := defaults
 			test.limit(&ceiling)
-			_, err := verify(path, testExpected(), ceiling)
+			_, err := verify(path, testExpected(), t.TempDir(), ceiling)
 			assertErrors(t, err, test.errors...)
 		})
 	}
@@ -641,7 +659,7 @@ func TestEntryInflatingPastItsDeclaredSize(t *testing.T) {
 	}
 	path := rewriteRaw(t, writeSample(t, testSpec()), named(sampleRoot+"Info.plist"), rawEntry{header: header, data: deflated.Bytes()})
 
-	_, err = IPA(path, testExpected())
+	_, err = IPA(path, testExpected(), t.TempDir())
 	assertErrors(t, err, ErrArchive)
 }
 
@@ -655,14 +673,96 @@ func TestRequiresExpectedValues(t *testing.T) {
 	} {
 		expected := testExpected()
 		clear(&expected)
-		if _, err := IPA(path, expected); err == nil {
+		if _, err := IPA(path, expected, t.TempDir()); err == nil {
 			t.Fatalf("verified against an incomplete lease %+v", expected)
 		}
 	}
 }
 
 func TestMissingFile(t *testing.T) {
-	if _, err := IPA(filepath.Join(t.TempDir(), "absent.ipa"), testExpected()); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := IPA(filepath.Join(t.TempDir(), "absent.ipa"), testExpected(), t.TempDir()); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("got %v, want fs.ErrNotExist", err)
+	}
+}
+
+func TestCentralDirectoryBudget(t *testing.T) {
+	entries := make([]sampleEntry, 200)
+	for index := range entries {
+		entries[index] = sampleEntry{name: fmt.Sprintf("Payload/App.app/Resources/resource-%03d.txt", index), data: []byte("x")}
+	}
+	path := rewrite(t, writeSample(t, testSpec()), nil, entries...)
+	ceiling := defaults
+	ceiling.directory = 8 << 10
+
+	_, err := verify(path, testExpected(), t.TempDir(), ceiling)
+
+	if !errors.Is(err, ErrEntries) {
+		t.Fatalf("verify = %v, want the central directory budget to refuse it", err)
+	}
+	ceiling.directory = 1 << 20
+	if _, err := verify(path, testExpected(), t.TempDir(), ceiling); err != nil {
+		t.Fatalf("verify within the budget: %v", err)
+	}
+}
+
+// TestCentralDirectoryBudgetIgnoresTheEndRecord rewrites the end record to declare one entry in a tiny directory:
+// archive/zip still reads every header, so only the read budget stops it.
+func TestCentralDirectoryBudgetIgnoresTheEndRecord(t *testing.T) {
+	entries := make([]sampleEntry, 65536)
+	for index := range entries {
+		entries[index] = sampleEntry{name: fmt.Sprintf("Payload/App.app/r/%05d", index)}
+	}
+	path := rewrite(t, writeSample(t, testSpec()), nil, entries...)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	end := bytes.LastIndex(data, []byte{'P', 'K', 5, 6})
+	total := binary.LittleEndian.Uint16(data[end+10:])
+	binary.LittleEndian.PutUint16(data[end+8:], total)
+	binary.LittleEndian.PutUint32(data[end+12:], 64)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ceiling := defaults
+	ceiling.directory = 1 << 20
+
+	_, err = verify(path, testExpected(), t.TempDir(), ceiling)
+
+	if !errors.Is(err, ErrEntries) {
+		t.Fatalf("verify = %v, want the read budget to refuse a directory its end record understates", err)
+	}
+}
+
+func TestUniversalBinaryArchitectureLimit(t *testing.T) {
+	header := binary.BigEndian.AppendUint32(nil, fatMagic)
+	header = binary.BigEndian.AppendUint32(header, 1_000_000)
+	_, err := signatures(bytes.NewReader(header), int64(len(header)), 1<<20, 8)
+	if err == nil || !strings.Contains(err.Error(), "limit 8") {
+		t.Fatalf("signatures = %v, want the architecture limit", err)
+	}
+}
+
+func TestEntitlementsLimit(t *testing.T) {
+	spec := testSpec()
+	spec.Entitlements = map[string]any{"padding": strings.Repeat("a", 2048)}
+	ceiling := defaults
+	ceiling.entitlements = 1024
+
+	_, err := verify(writeSample(t, spec), testExpected(), t.TempDir(), ceiling)
+
+	if !errors.Is(err, ErrSize) {
+		t.Fatalf("verify = %v, want the entitlements limit", err)
+	}
+}
+
+func TestExecutableSpoolsIntoTheGivenDirectory(t *testing.T) {
+	spool := t.TempDir()
+	directory := filepath.Join(spool, "missing")
+
+	_, err := IPA(writeSample(t, testSpec()), testExpected(), directory)
+
+	if err == nil || !strings.Contains(err.Error(), "spool executable") {
+		t.Fatalf("IPA = %v, want the spool to use the given directory", err)
 	}
 }

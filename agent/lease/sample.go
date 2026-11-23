@@ -1,6 +1,7 @@
 package lease
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,8 +27,8 @@ const sampleImage = "appwrite/distribution-fake"
 // the inputs the agent copied in and writes output/app.ipa (verify.Sample, signed for the lease's identifier, versions,
 // team and profile) and output/result.json, so a lease runs end to end without a Mac. FIXTURE_EXIT_CODE fails the
 // build with that status, FIXTURE_IDENTIFIER builds for another identifier so verification refuses it, and
-// FIXTURE_SLEEP_SECONDS delays the build.
-func Sample(work string) error {
+// FIXTURE_SLEEP_SECONDS delays the build. It stops, writing nothing, as soon as ctx ends.
+func Sample(ctx context.Context, work string) error {
 	input := filepath.Join(work, DirectoryInput)
 	data, err := os.ReadFile(filepath.Join(input, FileEnvironment))
 	if err != nil {
@@ -53,7 +54,12 @@ func Sample(work string) error {
 		if err != nil || seconds < 0 {
 			return fmt.Errorf("sample build: invalid %s", FixtureSleep)
 		}
-		time.Sleep(time.Duration(seconds) * time.Second)
+		if err := sleep(ctx, time.Duration(seconds)*time.Second); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if value := variables[FixtureExitCode]; value != "" && value != "0" {
 		code, err := strconv.Atoi(value)

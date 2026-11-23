@@ -2,8 +2,10 @@ package vm
 
 import (
 	"bytes"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +23,7 @@ func program(t *testing.T, name string) string {
 func TestSystemPassesArgumentsLiterally(t *testing.T) {
 	var output bytes.Buffer
 	literal := "$HOME `id` $(id) ; && 'quoted' \"double\""
-	handle, err := System{}.Start(Process{Path: program(t, "printf"), Args: []string{"%s", literal}, Stdout: &output})
+	handle, err := System{}.Start(Process{Path: program(t, "printf"), Arguments: []string{"%s", literal}, Stdout: &output})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,17 +35,25 @@ func TestSystemPassesArgumentsLiterally(t *testing.T) {
 	}
 }
 
-func TestSystemAppendsEnvironment(t *testing.T) {
+func TestSystemPassesAMinimalEnvironment(t *testing.T) {
+	t.Setenv("DISTRIBUTION_AGENT_SECRET", "enrolment-secret-sentinel")
+	t.Setenv("HOME", "/home/agent")
 	var output bytes.Buffer
-	handle, err := System{}.Start(Process{Path: program(t, "env"), Env: []string{"VM_TEST_VALUE=x y"}, Stdout: &output})
+	handle, err := System{}.Start(Process{Path: program(t, "env"), Environment: []string{"VM_TEST_VALUE=x y"}, Stdout: &output})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := handle.Wait(); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "\nVM_TEST_VALUE=x y\n") || !strings.Contains(output.String(), "PATH=") {
-		t.Fatalf("environment %q lacks the added value or the inherited one", output.String())
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	for _, want := range []string{"VM_TEST_VALUE=x y", "HOME=/home/agent", "LUME_TELEMETRY_ENABLED=false", "PATH=" + os.Getenv("PATH")} {
+		if !slices.Contains(lines, want) {
+			t.Errorf("environment %q lacks %q", lines, want)
+		}
+	}
+	if strings.Contains(output.String(), "enrolment-secret-sentinel") {
+		t.Errorf("the agent's own environment reached a child: %q", lines)
 	}
 }
 
@@ -61,7 +71,7 @@ func TestSystemReportsExitCodes(t *testing.T) {
 }
 
 func TestSystemKill(t *testing.T) {
-	handle, err := System{}.Start(Process{Path: program(t, "sleep"), Args: []string{"60"}})
+	handle, err := System{}.Start(Process{Path: program(t, "sleep"), Arguments: []string{"60"}})
 	if err != nil {
 		t.Fatal(err)
 	}

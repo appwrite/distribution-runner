@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -288,14 +289,80 @@ func TestDecodeBinaryRejects(t *testing.T) {
 	}
 }
 
-func TestDecodeBinaryNodeBudget(t *testing.T) {
+func TestDecodeBinaryExpansionBudget(t *testing.T) {
 	objects := make([][]byte, 0, 24)
 	for index := range 23 {
 		objects = append(objects, []byte{0xA2, byte(index + 1), byte(index + 1)})
 	}
 	objects = append(objects, []byte{0x09})
-	if _, err := decodePlist(rawBinaryPlist(objects...)); !errors.Is(err, errPlist) || !strings.Contains(err.Error(), "values") {
+	if _, err := decodePlist(rawBinaryPlist(objects...)); !errors.Is(err, errPlist) || !strings.Contains(err.Error(), "times its size") {
 		t.Fatalf("a 2^23 node expansion decoded: %v", err)
+	}
+}
+
+// widePlist builds a bplist00 file like rawBinaryPlist, with eight-byte offsets so objects may be large.
+func widePlist(objects ...[]byte) []byte {
+	data := bytes.Clone(binaryMagic)
+	var offsets []byte
+	for _, object := range objects {
+		offsets = binary.BigEndian.AppendUint64(offsets, uint64(len(data)))
+		data = append(data, object...)
+	}
+	table := len(data)
+	data = append(data, offsets...)
+	trailer := make([]byte, 32)
+	trailer[6], trailer[7] = 8, 1
+	binary.BigEndian.PutUint64(trailer[8:], uint64(len(objects)))
+	binary.BigEndian.PutUint64(trailer[24:], uint64(table))
+	return append(data, trailer...)
+}
+
+// sharedString is an array of count references to one string of size bytes.
+func sharedString(size int, count int) []byte {
+	array := binary.BigEndian.AppendUint32([]byte{0xAF, 0x12}, uint32(count))
+	array = append(array, bytes.Repeat([]byte{1}, count)...)
+	text := binary.BigEndian.AppendUint32([]byte{0x5F, 0x12}, uint32(size))
+	text = append(text, bytes.Repeat([]byte{'a'}, size)...)
+	return widePlist(array, text)
+}
+
+// TestDecodeBinarySharedStringIsBounded is the review's reproduction: 110 KB that referenced one 100 KB string
+// 10,000 times allocated about 1 GB before shared objects were decoded once and the decoded size was budgeted.
+func TestDecodeBinarySharedStringIsBounded(t *testing.T) {
+	data := sharedString(100_000, 10_000)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	_, err := decodePlist(data)
+
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, errPlist) || !strings.Contains(err.Error(), "times its size") {
+		t.Fatalf("decode = %v, want the decoded-size budget to refuse it", err)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8<<20 {
+		t.Fatalf("decoding %d bytes allocated %d bytes", len(data), allocated)
+	}
+}
+
+func TestDecodeBinarySharesDecodedObjects(t *testing.T) {
+	data := sharedString(1000, 50)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	decoded, err := decodePlist(data)
+
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	array, ok := decoded.([]any)
+	if !ok || len(array) != 50 || array[49] != strings.Repeat("a", 1000) {
+		t.Fatalf("decoded %T of %d", decoded, len(array))
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 20_000 {
+		t.Fatalf("decoding 50 references to one 1000-byte string allocated %d bytes, want the string once", allocated)
 	}
 }
 

@@ -7,6 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -14,13 +17,16 @@ import (
 type Layer interface {
 	// Create clones and boots a machine. On failure it removes whatever it made and returns a zero Machine.
 	Create(ctx context.Context, name string) (Machine, error)
-	// Exec runs Args inside the machine and returns its exit code. A non-zero exit is not an error; the error reports
-	// a failure to run the command at all, or ctx ending, which also stops the command.
+	// Exec runs Arguments inside the machine and returns its exit code. A non-zero exit is not an error; the error
+	// reports a failure to run the command at all, or ctx ending, which also stops the command.
 	Exec(ctx context.Context, machine Machine, command Command) (int, error)
-	// Copy moves a file or directory between the host and the machine.
+	// Copy moves a file or directory into the machine, or one regular file out of it.
 	Copy(ctx context.Context, machine Machine, transfer Transfer) error
 	// Destroy stops and deletes the machine. It succeeds when the machine is already gone, and on a zero Machine.
 	Destroy(ctx context.Context, machine Machine) error
+	// Sweep destroys every machine whose name starts with prefix that this Layer did not create, with its host
+	// files: what an earlier agent process left behind when it crashed or was killed.
+	Sweep(ctx context.Context, prefix string) error
 }
 
 // Machine identifies a created VM.
@@ -32,12 +38,12 @@ type Machine struct {
 	Home string
 }
 
-// Command is run inside the machine. Env is added to the guest login environment.
+// Command is run inside the machine. Environment is added to the guest login environment.
 type Command struct {
-	Args   []string
-	Env    map[string]string
-	Stdout io.Writer
-	Stderr io.Writer
+	Arguments   []string
+	Environment map[string]string
+	Stdout      io.Writer
+	Stderr      io.Writer
 }
 
 type Direction int
@@ -57,12 +63,15 @@ func (d Direction) String() string {
 	return fmt.Sprintf("Direction(%d)", int(d))
 }
 
-// Transfer copies Source to Destination. In copies from the host to the machine, Out the reverse. Destination names
-// the copy itself, its parent directories are created, and it must not be an existing directory.
+// Transfer copies Source to Destination. In copies a file or directory from the host to the machine, Out copies one
+// regular file of at most Limit bytes from the machine into a new host file of mode 0600. Destination names the copy
+// itself and its parent directories are created; an In destination must not be an existing directory, and an Out
+// destination must not exist at all.
 type Transfer struct {
 	Direction   Direction
 	Source      string
 	Destination string
+	Limit       int64
 }
 
 // ExitError carries a command's exit code. Fake's Build returns it to choose the code Exec reports.
@@ -77,7 +86,9 @@ func (e *ExitError) Error() string {
 var (
 	ErrNotFound    = errors.New("vm: machine not found")
 	ErrExists      = errors.New("vm: machine already exists")
-	ErrDestination = errors.New("vm: destination is an existing directory")
+	ErrDestination = errors.New("vm: destination already exists")
+	ErrNotFile     = errors.New("vm: source is not a regular file")
+	ErrLimit       = errors.New("vm: copy exceeds its limit")
 )
 
 // validateName accepts names that cannot be mistaken for a command-line option: a letter or digit, then letters,
@@ -107,12 +118,15 @@ func validateTransfer(transfer Transfer) error {
 	if strings.ContainsRune(transfer.Source, 0) || strings.ContainsRune(transfer.Destination, 0) {
 		return errors.New("vm: transfer path contains NUL")
 	}
+	if transfer.Direction == Out && transfer.Limit <= 0 {
+		return errors.New("vm: a copy out needs a positive limit")
+	}
 	return nil
 }
 
 // validateEnvironment accepts POSIX shell identifiers as keys, so every key can be exported by the guest shell.
-func validateEnvironment(env map[string]string) error {
-	for key, value := range env {
+func validateEnvironment(environment map[string]string) error {
+	for key, value := range environment {
 		if !identifier(key) {
 			return fmt.Errorf("vm: invalid environment name %q", key)
 		}
@@ -138,14 +152,45 @@ func identifier(name string) bool {
 	return true
 }
 
-func validateArgs(args []string) error {
-	if len(args) == 0 {
+func validateArguments(arguments []string) error {
+	if len(arguments) == 0 {
 		return errors.New("vm: command has no arguments")
 	}
-	for _, argument := range args {
+	for _, argument := range arguments {
 		if strings.ContainsRune(argument, 0) {
 			return errors.New("vm: command argument contains NUL")
 		}
 	}
 	return nil
+}
+
+// createExclusive creates destination, which must not exist, as a private file, with its parent directories.
+func createExclusive(destination string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, fs.ErrExist) {
+		return nil, fmt.Errorf("%w: %s", ErrDestination, destination)
+	}
+	return file, err
+}
+
+// limitWriter writes at most limit bytes to writer and fails with ErrLimit, writing nothing, once a write would
+// pass it.
+type limitWriter struct {
+	writer  io.Writer
+	limit   int64
+	written int64
+	over    bool
+}
+
+func (w *limitWriter) Write(data []byte) (int, error) {
+	if int64(len(data)) > w.limit-w.written {
+		w.over = true
+		return 0, ErrLimit
+	}
+	count, err := w.writer.Write(data)
+	w.written += int64(count)
+	return count, err
 }

@@ -107,3 +107,20 @@ func TestParseEnvironmentRejectsMalformed(t *testing.T) {
 		}
 	}
 }
+
+func TestBundleName(t *testing.T) {
+	for name, valid := range map[string]bool{
+		"com.example.app":        true,
+		"com.example-app.widget": true,
+		"io.app2.Extension":      true,
+		"com.example_app":        false,
+		".com.example":           false,
+		"com/example":            false,
+		"":                       false,
+		"com.exämple":            false,
+	} {
+		if got := bundleName(name); got != valid {
+			t.Errorf("bundleName(%q) = %v, want %v", name, got, valid)
+		}
+	}
+}
