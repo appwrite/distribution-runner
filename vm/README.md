@@ -106,9 +106,15 @@ On the host, with lume 0.7.2 (`LUME_TELEMETRY_ENABLED=false`) and `vm/versions.e
    ```
 
    It accepts the Xcode licence and runs `xcodebuild -runFirstLaunch` (the operator accepts Apple's licence by running it), checks every pinned version, and prints the image name, the labels and the guest's ed25519 host key.
-6. Put that host key line in the agent's known hosts file under the alias `$IMAGE`; every clone shares it.
+6. Put that host key in the agent's known hosts file with `$IMAGE` as the host, as `$IMAGE ssh-ed25519 AAAA…` (the agent checks every clone, which shares the key, under the golden image's name).
 7. `lume stop "$IMAGE"`. The golden image stays stopped: `lume clone` refuses a running source.
-8. Start the agent with the golden image `$IMAGE` and the labels from `vm/labels` (one per line).
+8. Start the agent (`agent/README.md`) with the golden image and the labels from `vm/labels` joined with commas:
+
+   ```sh
+   distribution-agent --endpoint https://<appwrite>/v1 --secret-file <secret> \
+     --golden "$IMAGE" --labels "$(paste -sd , vm/labels)" \
+     --ssh-key <agent-key> --known-hosts <known-hosts>
+   ```
 
 ## Labels
 
