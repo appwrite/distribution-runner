@@ -6,12 +6,15 @@ workspace=$(mktemp -d "${TMPDIR:-/tmp}/android.XXXXXX")
 log=$workspace.log
 identifier=io.appwrite.distribution.smoke
 output=$workspace/volume/builds/smoke
+container=android-terminate-$$
+script=/mnt/code/source/smoke/android/app/build.gradle.kts
 
 inside() {
   docker run --rm -v "$workspace:/mnt/code" "$image" "$@"
 }
 
 cleanup() {
+  docker rm -f "$container" > /dev/null 2>&1 || true
   inside find /mnt/code -mindepth 1 -delete > /dev/null 2>&1 || true
   rmdir "$workspace" 2> /dev/null || true
   rm -f "$log"
@@ -28,9 +31,10 @@ job() {
     -e DISTRIBUTION_OUTPUT_PATH='build/app/outputs/bundle/release/*.aab' \
     -e DISTRIBUTION_OUTPUT_DIR=/mnt/code/volume/builds/smoke \
     -e DISTRIBUTION_CACHE_ARTIFACT=cache/smoke.sqfs \
+    -e DISTRIBUTION_IDENTIFIER="$identifier" \
     -e DISTRIBUTION_VERSION_NAME=9.8.7-smoke \
     -e DISTRIBUTION_VERSION_CODE=4242 \
-    "$@" "$image" /usr/local/distribution/build.sh 2>&1 | tee "$log" || status=$?
+    "$@" "$image" /bin/sh -c /usr/local/distribution/build.sh 2>&1 | tee "$log" || status=$?
   return "$status"
 }
 
@@ -56,8 +60,18 @@ expect_log() {
   fi
 }
 
+reject_log() {
+  if grep -qF -- "$1" "$log"; then
+    fail "log contains: $1"
+  fi
+}
+
 reset_outputs() {
   inside rm -rf /mnt/code/output /mnt/code/volume
+}
+
+restore_script() {
+  inside cp "$script.pristine" "$script"
 }
 
 manifest() {
@@ -91,8 +105,6 @@ with open(wrapper_path, encoding='utf-8') as handle:
     for line in handle:
         if line.startswith('distributionUrl='):
             gradle = line.strip().rsplit('/gradle-', 1)[1].rsplit('-', 1)[0]
-major, minor = (int(part) for part in gradle.split('.')[:2])
-java = '17.' if (major, minor) < (8, 5) else '21.'
 
 expected = {
     'artifact': 'app-unsigned.aab',
@@ -100,26 +112,22 @@ expected = {
     'identifier': identifier,
     'versionName': '9.8.7-smoke',
     'versionCode': int(code),
+    'toolchain': {
+        'image': image,
+        'fastlane': '2.242.0',
+        'java': '21.0.13.1+2-LTS',
+        'gradle': gradle,
+        'flutter': '3.41.2',
+    },
 }
 problems = [f'{key} is {result.get(key)!r}, expected {value!r}' for key, value in expected.items() if result.get(key) != value]
 if type(result.get('versionCode')) is not int:
     problems.append('versionCode is not a JSON integer')
-toolchain = result.get('toolchain', {})
-if toolchain.get('image') != image:
-    problems.append(f'toolchain.image is {toolchain.get("image")!r}, expected {image!r}')
-if toolchain.get('fastlane') != '2.242.0':
-    problems.append(f'toolchain.fastlane is {toolchain.get("fastlane")!r}')
-if not str(toolchain.get('java')).startswith(java):
-    problems.append(f'toolchain.java is {toolchain.get("java")!r}, expected {java}x for Gradle {gradle}')
-if toolchain.get('gradle') != gradle:
-    problems.append(f'toolchain.gradle is {toolchain.get("gradle")!r}, expected {gradle!r}')
-if toolchain.get('flutter') != '3.41.2':
-    problems.append(f'toolchain.flutter is {toolchain.get("flutter")!r}')
 
 with zipfile.ZipFile(bundle_path) as bundle:
     signatures = [
         name for name in bundle.namelist()
-        if name.startswith('META-INF/') and name.count('/') == 1 and name.upper().endswith(('.SF', '.RSA', '.DSA', '.EC'))
+        if name.upper().startswith('META-INF/') and name.count('/') == 1 and name.upper().endswith(('.SF', '.RSA', '.DSA', '.EC'))
     ]
 if signatures:
     problems.append(f'the bundle has signature entries: {signatures}')
@@ -130,7 +138,7 @@ PYTHON
   [[ $(manifest /manifest/@package) == "$identifier" ]] || fail 'manifest package differs'
   [[ $(manifest /manifest/@android:versionCode) == "$code" ]] || fail 'manifest versionCode differs'
   [[ $(manifest /manifest/@android:versionName) == 9.8.7-smoke ]] || fail 'manifest versionName differs'
-  [[ -f $output/mapping.txt ]] || fail 'mapping.txt is missing'
+  [[ -s $output/mapping.txt ]] || fail 'mapping.txt is missing or empty for a minified release build'
   if [[ -n $(find "$workspace/output" "$output" "$workspace/cache" -name '.*' -type f -print -quit) ]]; then
     fail 'temporary files were left behind'
   fi
@@ -150,6 +158,7 @@ check_cache() {
 test_cold() {
   local status=0
   inside flutter create --org io.appwrite.distribution --project-name smoke --platforms android /mnt/code/source/smoke > /dev/null
+  inside cp "$script" "$script.pristine"
   job || status=$?
   expect_status 0 "$status" 'cold build'
   expect_log 'cache: none'
@@ -163,40 +172,128 @@ test_cold() {
 test_warm() {
   local status=0
   reset_outputs
-  inside rm -rf /mnt/code/.distribution /mnt/code/source/smoke/build
+  inside rm -rf /mnt/code/.distribution /mnt/code/source/smoke/build /mnt/code/source/smoke/.dart_tool /mnt/code/source/smoke/android/.gradle /mnt/code/source/smoke/android/app/.cxx
   job -e DISTRIBUTION_VERSION_CODE=4243 || status=$?
   expect_status 0 "$status" 'warm build'
   expect_log 'cache: restored'
   check_result 4243
-  pass 'warm flutter build restored the cache'
+  check_cache
+  pass 'warm flutter build restored the cache and saved it again'
 }
 
 test_signed() {
   local status=0
   reset_outputs
+  inside sh -c 'mkdir -p /mnt/code/cache && echo unreadable > /mnt/code/cache/corrupt.sqfs'
   job \
     -e DISTRIBUTION_INSTALL_COMMAND= \
-    -e DISTRIBUTION_BUILD_COMMAND="python3 -c \"import os, zipfile; os.makedirs('signed', exist_ok=True); bundle = zipfile.ZipFile('signed/app.aab', 'w'); bundle.writestr('META-INF/UPLOAD.SF', 'x'); bundle.close()\"" \
+    -e DISTRIBUTION_BUILD_COMMAND="python3 -c \"import os, zipfile; os.makedirs('signed', exist_ok=True); bundle = zipfile.ZipFile('signed/app.aab', 'w'); bundle.writestr('meta-inf/UPLOAD.SF', 'x'); bundle.close()\"" \
     -e DISTRIBUTION_OUTPUT_PATH='signed/*.aab' \
-    -e DISTRIBUTION_CACHE_ARTIFACT= \
+    -e DISTRIBUTION_CACHE_ARTIFACT=cache/corrupt.sqfs \
     || status=$?
   expect_status 3 "$status" 'signed build'
   expect_log 'build_already_signed'
+  expect_log 'cache: unreadable, continuing without it'
   [[ ! -e $output/app-unsigned.aab ]] || fail 'a signed bundle was published'
-  pass 'a signed bundle exits 3 with build_already_signed'
+  [[ ! -e $workspace/cache/corrupt.sqfs ]] || fail 'the unreadable cache was left in the workspace'
+  pass 'a signed bundle exits 3 with build_already_signed, and an unreadable cache is skipped and removed'
 }
 
 test_keystore() {
   local status=0
   reset_outputs
-  inside sh -c 'printf "\nval keystoreProperties = java.util.Properties().apply { load(java.io.FileInputStream(rootProject.file(\"key.properties\"))) }\n" >> /mnt/code/source/smoke/android/app/build.gradle.kts'
+  inside sh -c "printf '\nval keystoreText = rootProject.file(\"key.properties\").readText()\n' >> $script"
   job -e DISTRIBUTION_INSTALL_COMMAND= -e DISTRIBUTION_CACHE_ARTIFACT= || status=$?
+  restore_script
   expect_status 4 "$status" 'keystore build'
+  expect_log 'key.properties (No such file or directory)'
   expect_log 'build_keystore_required'
-  pass 'an unguarded keystore read exits 4 with build_keystore_required'
+  pass 'an unguarded key.properties read exits 4 with build_keystore_required'
+}
+
+test_compilation_error() {
+  local status=0
+  reset_outputs
+  inside sh -c "printf '\nval signingNote: Int = \"key.properties\"\n' >> $script"
+  job -e DISTRIBUTION_INSTALL_COMMAND= -e DISTRIBUTION_CACHE_ARTIFACT= || status=$?
+  restore_script
+  expect_status 1 "$status" 'compilation error build'
+  expect_log 'Script compilation error'
+  reject_log 'build_keystore_required'
+  pass 'a build script compilation error that mentions key.properties exits 1, not 4'
+}
+
+test_java_17() {
+  local status=0
+  reset_outputs
+  inside sh -c 'mkdir -p /mnt/code/source/legacy/gradle/wrapper && printf "%s\n" "distributionUrl = https\\://services.gradle.org/distributions/gradle-8.4-bin.zip" > /mnt/code/source/legacy/gradle/wrapper/gradle-wrapper.properties'
+  job \
+    -e DISTRIBUTION_FRAMEWORK= \
+    -e DISTRIBUTION_ROOT_DIRECTORY=legacy \
+    -e DISTRIBUTION_INSTALL_COMMAND= \
+    -e DISTRIBUTION_BUILD_COMMAND='java -version' \
+    -e DISTRIBUTION_OUTPUT_PATH='none/*.aab' \
+    -e DISTRIBUTION_CACHE_ARTIFACT= \
+    || status=$?
+  expect_status 2 "$status" 'java 17 build'
+  expect_log 'gradle: 8.4, java: /opt/java/17'
+  expect_log 'version "17.0.21.1"'
+  pass 'a Gradle 8.4 wrapper written with spaces selects JDK 17'
+}
+
+test_react_native() {
+  local status=0
+  reset_outputs
+  inside mkdir -p /mnt/code/source/native/android
+  job \
+    -e DISTRIBUTION_FRAMEWORK=react-native \
+    -e DISTRIBUTION_ROOT_DIRECTORY=native \
+    -e DISTRIBUTION_INSTALL_COMMAND=pwd \
+    -e DISTRIBUTION_BUILD_COMMAND=pwd \
+    -e DISTRIBUTION_OUTPUT_PATH='android/app/build/outputs/bundle/release/*.aab' \
+    -e DISTRIBUTION_CACHE_ARTIFACT= \
+    || status=$?
+  expect_status 2 "$status" 'react native layout'
+  grep -qxF /mnt/code/source/native "$log" || fail 'the install command did not run in the root'
+  expect_log /mnt/code/source/native/android
+  pass 'react-native installs in the root and builds in android/'
+}
+
+test_terminate() {
+  local status started=0 elapsed
+  reset_outputs
+  docker run -d --name "$container" -v "$workspace:/mnt/code" \
+    -e DISTRIBUTION_ROOT_DIRECTORY=smoke \
+    -e DISTRIBUTION_BUILD_COMMAND='sleep 600' \
+    -e DISTRIBUTION_OUTPUT_PATH='none/*.aab' \
+    "$image" /bin/sh -c /usr/local/distribution/build.sh > /dev/null
+  for _ in $(seq 1 120); do
+    docker logs "$container" > "$log" 2>&1
+    if grep -qF '$ sleep 600' "$log"; then
+      started=1
+      break
+    fi
+    sleep 1
+  done
+  (( started )) || fail 'the lane never started the build command'
+  expect_log '[distribution] build: sleep 600'
+  SECONDS=0
+  docker stop -t 60 "$container" > /dev/null
+  elapsed=$SECONDS
+  status=$(docker inspect -f '{{.State.ExitCode}}' "$container")
+  docker logs "$container" > "$log" 2>&1
+  docker rm "$container" > /dev/null
+  expect_status 143 "$status" 'terminated build'
+  expect_log 'build: terminated by signal'
+  (( elapsed < 20 )) || fail "the build took ${elapsed}s to stop after SIGTERM"
+  pass "SIGTERM through /bin/sh -c stops the build in ${elapsed}s with exit 143, and logs stream live"
 }
 
 test_cold
 test_warm
 test_signed
 test_keystore
+test_compilation_error
+test_java_17
+test_react_native
+test_terminate
