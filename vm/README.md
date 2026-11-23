@@ -1,0 +1,187 @@
+# vm
+
+Recipe for the golden macOS image that every iOS build VM is cloned from (RFC §9.3–9.5, Appendix J). The agent clones it with lume for each lease, copies the inputs in, runs `/usr/local/distribution/build.sh`, copies the outputs out and destroys the clone (`agent/vm/README.md`).
+
+**Unproven pending spike S7.** This recipe has never been run, and no iOS build has gone through `build.sh` on a real Mac with a real Apple distribution identity.
+
+| File | Purpose |
+|---|---|
+| `versions.env` | Every pin: image name, macOS, Xcode, Ruby (through ruby-build), libyaml, fastlane, CocoaPods, Node, Flutter, Apple WWDR intermediates |
+| `labels` | Runner labels the image advertises; `provision.sh` refuses to run when they disagree with `versions.env` |
+| `provision.sh` | Run once over SSH, as the guest user, on a fresh VM with Xcode installed (bash 3.2) |
+| `cocoapods/Gemfile`, `cocoapods/Gemfile.lock` | CocoaPods and every gem it depends on, locked for `arm64-darwin`, `x86_64-darwin` and `ruby` |
+| `host-key.sh`, `io.appwrite.distribution.host-key.plist` | The launch daemon that installs the ssh host key the agent minted for each clone |
+
+## Image layout
+
+| Path | Contents | Owner |
+|---|---|---|
+| `/usr/local/distribution/build.sh` | `scripts/build-ios.sh` | root |
+| `/usr/local/distribution/fastlane/Fastfile` | `lanes/Fastfile` | root |
+| `/usr/local/distribution/{Gemfile,Gemfile.lock,.bundle,vendor}` | fastlane 2.242.0, deployment bundle | root |
+| `/usr/local/distribution/ruby` | Ruby 3.3.14 (ruby-build, its own OpenSSL, libyaml), bundler, and CocoaPods installed from `/usr/local/distribution/cocoapods`'s lock | root |
+| `/usr/local/distribution/host-key.sh`, `/Library/LaunchDaemons/io.appwrite.distribution.host-key.plist` | Installs each clone's host key at boot | root |
+| `/usr/local/distribution/node` | Node | root |
+| `/usr/local/distribution/flutter` | Flutter with the iOS artifacts precached | guest user, because Flutter writes its own cache |
+| `/usr/local/distribution/{versions.env,labels}` | What `build.sh` reports in `toolchain` | root |
+
+The image also has the Apple WWDR G3–G6 intermediates in the System keychain (so an Apple-issued distribution certificate is a valid identity), automatic updates and Spotlight off, ssh password and keyboard-interactive login off, no Xcode account, no signing identity and no provisioning profile.
+
+It has no admin account: `provision.sh` ends by giving the guest user a random password that nobody keeps (rewriting `/etc/kcpassword` so autologin still works, and removing the login keychain, which macOS recreates with it) and taking away every `sudo` right it has: it leaves `admin`, every `/etc/sudoers.d` file that names it is deleted, and provisioning fails unless `sudo -l -U <user>` then reports that it may run nothing. So build code cannot `sudo` to read another machine's secrets or reconfigure the guest. Nothing in `build.sh` needs admin: `xcodebuild -license accept` and `-runFirstLaunch` run at provisioning, and the keychain, profiles, Xcode, fastlane, CocoaPods, Flutter and Node all work as the user. Refresh the image by building a new one, never by provisioning it again.
+
+The agent never trusts a host key the image carries. `provision.sh` deletes `/etc/ssh/ssh_host_*`, but macOS regenerates them (`sshd-keygen-wrapper`) at the next ssh connection, the operator's clean-up in step 5 included, so every clone starts with the golden image's keys. The agent mints an ed25519 host key for each clone, shares it read-only into that clone alone (`lume run --shared-dir <dir>/host-key:ro`) and pins only that key, with `HostKeyAlgorithms=ssh-ed25519`. At boot, `host-key.sh` waits up to 300 seconds for that share, mounting the `com.apple.virtio-fs.automount` device itself after 30 when the automount has not appeared, and installs the key as `/etc/ssh/ssh_host_ed25519_key`; sshd reads it on the next connection. It accepts the key at the root of the share or in a `host-key` directory under it, at `/Volumes/My Shared Files` or its own mount, since which of these lume 0.7.2 presents for a single shared directory is part of S7. Until it does, the agent refuses the key the guest answers with and retries, so one clone can never answer for another.
+
+## `build.sh` contract
+
+The agent writes, under `DISTRIBUTION_WORK` (default `$HOME/distribution`):
+
+| Input | Contents |
+|---|---|
+| `input/source.tar.gz` | The checkout as a single-root archive; unpacked into `source/` with one level stripped, then deleted |
+| `input/environment` | `export K='v'` lines: the lease environment plus `DISTRIBUTION_PLATFORM`, `DISTRIBUTION_FRAMEWORK`, `DISTRIBUTION_ROOT_DIRECTORY`, `DISTRIBUTION_INSTALL_COMMAND`, `DISTRIBUTION_BUILD_COMMAND`, `DISTRIBUTION_VERSION_NAME`, `DISTRIBUTION_VERSION_CODE`, `DISTRIBUTION_TEAM_ID` (required), `DISTRIBUTION_BUILD_ID`, `CI=true`. `DISTRIBUTION_IDENTIFIER`, `DISTRIBUTION_CONFIGURATION` and `DISTRIBUTION_SCHEME` come through the lease environment |
+| `input/signing/certificate.p12`, `input/signing/password` | The identity; both deleted as soon as the identity is in the keychain |
+| `input/signing/profiles/<bundleId>.mobileprovision` | One App Store profile per bundle identifier, the app's and each extension's |
+
+and reads back `output/app.ipa`, `output/result.json` and `output/dsyms.zip` after a zero exit.
+
+In order, `build.sh`:
+
+1. Sources `input/environment`, then sets its own `PATH`, `IFS`, `DISTRIBUTION_HOME=/usr/local/distribution`, `DISTRIBUTION_SOURCE=$DISTRIBUTION_WORK/source`, `GEM_HOME=~/.gem`, `npm_config_prefix=~/.npm-global` and a UTF-8 locale. Unpacks the source and resolves the root directory inside it.
+2. Creates `signing.keychain-db` with a random `openssl rand` password, auto-lock after six hours, unlocks it, puts it first on the user search list, imports the PKCS#12 with `-T /usr/bin/codesign` and sets the key partition list to `apple:` alone. Every command that carries a password is fed to `security -i` on standard input, so no password is ever in a process's arguments. `apple:` is the partition securityd gives Apple-signed code such as `codesign` and Xcode; `security` itself is `apple-tool:` (securityd `clientid.cpp`), so leaving that out keeps `security export` from extracting the key without the keychain password. If macOS refuses the PBES2/AES-256 PKCS#12 the server produces (RFC Appendix N, item 3), it re-encodes it once with LibreSSL as PBE-SHA1-3DES and imports that. Exactly one valid code signing identity of `DISTRIBUTION_TEAM_ID` must result.
+3. Decodes every profile (`security cms -D`, into the throwaway keychain) and checks it: team, App Store type (no devices), not expired, application identifier covering the bundle identifier, and the identity's certificate among `DeveloperCertificates`. Writes `exportOptions.plist` (`app-store-connect`, manual signing, the team, the identity's SHA-1, the bundle → UUID map) and installs each profile by UUID into both `~/Library/MobileDevice/Provisioning Profiles/` and `~/Library/Developer/Xcode/UserData/Provisioning Profiles/`. Then locks the keychain.
+4. Runs the install command in the root with the keychain locked and the PKCS#12 already deleted. A process it leaves running is still there when the keychain is unlocked next, but it cannot read the keychain password from the process table, and the key's partition list keeps anything but Apple-signed tools from using it.
+5. Unlocks the keychain and runs `/usr/local/distribution/ruby/bin/bundle exec fastlane ios build` from `/usr/local/distribution` (`lanes/README.md`) with a `PATH` of image directories only, `GEM_HOME` and `GEM_PATH` unset and `BUNDLE_APP_CONFIG=/usr/local/distribution/.bundle`, so a `bundle`, `ruby`, gem or `~/.bundle/config` the install command left cannot take over the lane. The lane gives the customer `PATH` and `GEM_HOME` back to the build command alone, then archives.
+6. Exports with `xcodebuild -exportArchive`, reads the built `Info.plist` from the `.ipa`, and checks it against `DISTRIBUTION_IDENTIFIER`, `DISTRIBUTION_VERSION_NAME` and `DISTRIBUTION_VERSION_CODE` (an empty value is not checked).
+7. Writes `output/app.ipa`, `output/dsyms.zip` (the archive's `dSYMs`, empty when there are none) and `output/result.json`.
+8. On any exit, restores the search list, deletes the keychain, the installed profiles (and their directories when empty) and whatever remains of `input/signing`.
+
+`result.json` is written by python3:
+
+```json
+{"artifact": "app.ipa", "type": "ipa", "identifier": "com.example.app", "versionName": "1.4.0", "versionCode": "57", "toolchain": {"image": "distribution-macos-27.0.1-xcode-27.2-r1", "fastlane": "2.242.0", "xcode": "27.2", "flutter": null}}
+```
+
+`versionCode` is the `CFBundleVersion` string. `flutter` is null unless `DISTRIBUTION_FRAMEWORK` is `flutter`.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Success; all three outputs written |
+| 1 | The install command, build command or archive failed |
+| 2 | Invalid input: a missing file, `DISTRIBUTION_TEAM_ID` unset, an unreadable archive, a root directory outside the checkout, no profile |
+| 3 | The built `CFBundleShortVersionString` or `CFBundleVersion` differs from the requested version |
+| 4 | Signing material rejected: import failed, not exactly one valid identity of the team, or a profile failed a check |
+| 5 | `xcodebuild -exportArchive` failed, did not produce exactly one `.ipa`, or that `.ipa` does not hold exactly one application |
+| 6 | The built `CFBundleIdentifier` differs from `DISTRIBUTION_IDENTIFIER` |
+| 130, 143 | Interrupted or terminated; cleanup still ran |
+
+## Building the golden image
+
+On the host, with lume 0.7.2 (`LUME_TELEMETRY_ENABLED=false`) and `vm/versions.env` loaded (`. vm/versions.env`):
+
+1. Create and install macOS from a restore image for `MACOS_VERSION` (`lume ipsw` prints Apple's latest supported one). Keep the `.ipsw` and record its SHA-256 next to the image.
+
+   ```sh
+   lume create "$IMAGE" --os macOS --ipsw <path-to.ipsw> --cpu 4 --memory 8GB --disk-size 200GB --unattended tahoe
+   ```
+
+   The unattended setup creates the admin user `lume` (password `lume`) and enables SSH; `provision.sh` replaces the password and takes the user out of `admin` at the end. lume 0.7.2 ships presets for Sequoia and Tahoe only; whether `tahoe` works for macOS 27 is part of S7.
+2. Boot it and find its address:
+
+   ```sh
+   lume run "$IMAGE" --display none --vnc disabled &
+   lume get "$IMAGE" --format json
+   ```
+
+3. Install the agent's public key: `ssh-copy-id -i <agent-key>.pub lume@<address>`. `provision.sh` turns password login off, so do this first.
+4. Install Xcode by hand, never signing in to an Apple account inside the VM: download `Xcode_$XCODE_VERSION.xip` on the host from developer.apple.com, `scp` it in, then in the VM:
+
+   ```sh
+   xip --expand "Xcode_$XCODE_VERSION.xip"
+   sudo mv Xcode.app "/Applications/Xcode-$XCODE_VERSION.app"
+   sudo xcode-select --switch "/Applications/Xcode-$XCODE_VERSION.app"
+   xcodebuild -downloadPlatform iOS
+   rm "Xcode_$XCODE_VERSION.xip"
+   ```
+
+5. Provision. `provision.sh` asks for the `lume` password through `sudo`, so it needs a terminal:
+
+   ```sh
+   ssh lume@<address> mkdir distribution-runner
+   scp -r lanes scripts vm lume@<address>:distribution-runner/
+   ssh -t lume@<address> distribution-runner/vm/provision.sh
+   ssh lume@<address> rm -rf distribution-runner
+   ```
+
+   It accepts the Xcode licence and runs `xcodebuild -runFirstLaunch` (the operator accepts Apple's licence by running it), checks every pinned version, installs the host-key daemon, deletes the image's host keys (macOS regenerates them; the agent never trusts them), locks the guest account and prints the image name and the labels. The `sudo` it asks for is the last one the image ever accepts.
+6. `lume stop "$IMAGE"`. The golden image stays stopped: `lume clone` refuses a running source.
+7. Set up the host (below), then start the agent (`agent/README.md`) with the golden image and the labels from `vm/labels` joined with commas:
+
+   ```sh
+   distribution-agent --endpoint https://<appwrite>/v1 --secret-file <secret> \
+     --golden "$IMAGE" --labels "$(paste -sd , vm/labels)" --ssh-key <agent-key>
+   ```
+
+## Host setup
+
+Required before a host runs two leases at once, and unproven until spike S7 shows it holds; the agent refuses `--capacity 2` with lume until then. Two clones share lume's vmnet NAT bridge, so without it one guest can reach the other, answer ARP for its address, or probe the host.
+
+1. Per-machine host keys (above, done by the agent and the image): a guest that wins the address of another still cannot present that machine's key, so the agent never sends it a lease's secrets.
+2. A `pf` anchor on the vmnet bridge that blocks guest-to-guest traffic and guest-to-host traffic other than DHCP and DNS. With lume's default `192.168.64.0/24` on `bridge100` (check `ifconfig` and `lume get` on the host):
+
+   ```
+   # /etc/pf.anchors/io.appwrite.distribution
+   guests = "192.168.64.0/24"
+   gateway = "192.168.64.1"
+   pass in quick on bridge100 proto udp from any port 68 to any port 67
+   pass in quick on bridge100 proto { udp tcp } from $guests to $gateway port 53
+   block drop in quick on bridge100 from $guests to $guests
+   block drop in quick on bridge100 from $guests to $gateway
+   ```
+
+   Load it from `/etc/pf.conf` with `anchor "io.appwrite.distribution"` and `load anchor "io.appwrite.distribution" from "/etc/pf.anchors/io.appwrite.distribution"`, then `pfctl -ef /etc/pf.conf`. The agent's own ssh to a guest is host-initiated, so its replies match pf state and pass. Whether pf sees frames bridged between two guests on `bridge100` at all is what S7 must prove.
+3. A static ARP entry per clone (`arp -s <address> <mac> ifscope bridge100`, the MAC from `lume get`) so a guest cannot take another's address on the host. The agent does not do this yet; it is part of S7.
+
+## Labels
+
+`labels` lists what the image advertises, one per line: `macos-<version>`, `xcode-<version>`, `flutter-<version>`, `node-<version>`, `cocoapods-<version>`. A target's `configuration.xcode` becomes a required `xcode-<version>` label, so a lease only lands on an image with that Xcode.
+
+## Yearly refresh
+
+Apple raises the minimum SDK for App Store uploads every April (the iOS 27 SDK from April 2027). By the end of March each year:
+
+1. Update `versions.env` to the new macOS, Xcode, Flutter, Node and CocoaPods, bump `IMAGE` (a new name, never an in-place rebuild), and update `labels`.
+2. Build the new image with the steps above on one host, run a Flutter, a React Native and a native app through it, then roll it out host by host while the old image keeps serving leases that require the old `xcode-` label.
+3. Retire the old image once no target requires its label, and record each Xcode's deployment-target floor for preflight (Xcode 27.2 rejects targets below iOS 15.0).
+
+## Pins
+
+| Pin | Value | Source |
+|---|---|---|
+| macOS | 27.0.1 | build host (`sw_vers`) |
+| Xcode | 27.2 (27B52) | build host (`xcodebuild -version`); RFC §9.5 |
+| Ruby | 3.3.14 | `cache.ruby-lang.org/pub/ruby/index.txt`, sha256 `d0438ee2…` checked by ruby-build |
+| ruby-build | `v20261119` = `b91ffe95bf6350b8fce3170585c442f20b62619f` | GitHub release and tag ref |
+| libyaml | 0.2.5 | pyyaml.org tarball, sha256 pinned |
+| fastlane | 2.242.0 | rubygems.org latest, released 2026-11-16; `lanes/Gemfile.lock` |
+| bundler | 2.5.22 | ships with Ruby 3.3.14; `BUNDLED WITH` |
+| CocoaPods | 1.17.0 | rubygems.org latest; its dependencies locked in `cocoapods/Gemfile.lock` |
+| Node | 26.13.1 (LTS) | `nodejs.org/dist/v26.13.1/SHASUMS256.txt`, same as the android image |
+| Flutter | 3.41.2 | `releases_macos.json` (arm64 archive), same as the android image |
+| Apple WWDR G3–G6 | sha256 pinned | `apple.com/certificateauthority` |
+
+## Unproven (S7)
+
+- The whole recipe: lume's unattended setup on macOS 27, provisioning, clone and boot times, two concurrent clones per host, and whether clones on the shared NAT can reach each other (password login is off for that reason). The host setup above, the `pf` anchor and ARP pinning in particular.
+- The guest without admin rights: Xcode, `xcodebuild -exportArchive`, CocoaPods, Flutter and the keychain steps as a standard user, autologin with the rewritten `/etc/kcpassword`, and macOS recreating the removed login keychain.
+- The host-key share: automounted early enough at boot, or mountable by `mount_virtiofs`, and sshd answering with the installed key on the next connection.
+- `codesign` and `xcodebuild -exportArchive` with the partition list set to `apple:` alone (by securityd's `clientid.cpp`, `codesign` is `apple:`), and `security -i` running import, unlock and the partition list from standard input with the same exit status as the plain commands.
+- The image-only `PATH` for the lane, and CocoaPods installed into the system gems from `cocoapods/Gemfile.lock` with `path.system`.
+- `security import` of the server's PBES2/AES-256 PKCS#12 on macOS 27, and the LibreSSL re-encode fallback (the re-encode itself is checked on LibreSSL 3.3.6; the import of either form is not).
+- `build_app` with manual signing passed only as `CODE_SIGN_STYLE`, `DEVELOPMENT_TEAM` and `CODE_SIGN_IDENTITY`: an app target whose project names no profile may fail to archive under `CODE_SIGN_STYLE=Manual`; apps with extensions, app groups, push and Swift Package resource bundles are the risk.
+- The split of `build_app(skip_package_ipa: true)` and `xcodebuild -exportArchive`, an export producing an `.ipa`, and whether export works without network and with no Xcode account.
+- `security cms -D -k` importing a profile's embedded certificates into the throwaway keychain rather than the login keychain.
+- The real Apple signing path end to end (S3, S4), including `find-identity -v` with only the WWDR intermediates installed.
+
+## Split signing (not installed)
+
+`scripts/archive-ios.sh` is VM 1 of `_APP_DISTRIBUTION_IOS_SIGNING=split` (RFC §9.4, Appendix M): it archives with code signing disabled, for a second VM with no customer code to sign. That mode ships only once S7 proves it, so `provision.sh` does not install the script yet.
