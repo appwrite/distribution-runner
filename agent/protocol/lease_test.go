@@ -1,0 +1,170 @@
+package protocol
+
+import (
+	"context"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestSessionSendsLeaseTokenAndQueryHeaders(t *testing.T) {
+	server := newFake(t)
+	server.handle("PATCH "+leasePath, func(writer http.ResponseWriter, _ *http.Request) {
+		respond(t, writer, http.StatusOK, map[string]any{"expiresAt": "2026-11-23T10:05:00.000+00:00", "canceled": false})
+	})
+	server.handle("GET "+leasePath+"/source", func(writer http.ResponseWriter, _ *http.Request) {
+		respond(t, writer, http.StatusOK, map[string]any{"url": "https://codeload.example/a.tar.gz", "headers": []string{}, "format": "tarball"})
+	})
+	server.handle("POST "+leasePath+"/events", func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	})
+	server.handle("POST "+leasePath+"/artifacts", func(writer http.ResponseWriter, _ *http.Request) {
+		respond(t, writer, http.StatusAccepted, map[string]any{"$id": "upload1", "chunksTotal": 1, "chunksUploaded": 1})
+	})
+	path := filepath.Join(t.TempDir(), "app.ipa")
+	if err := os.WriteFile(path, []byte("ipa"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session := server.session(t)
+	ctx := context.Background()
+
+	if _, err := session.Extend(ctx); err != nil {
+		t.Fatalf("Extend: %v", err)
+	}
+	if _, err := session.Source(ctx); err != nil {
+		t.Fatalf("Source: %v", err)
+	}
+	if err := session.Report(ctx, []Event{{Type: TypeStart}}); err != nil {
+		t.Fatalf("Report: %v", err)
+	}
+	if _, err := session.Upload(ctx, path); err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+
+	requests := server.recorded()
+	if len(requests) != 4 {
+		t.Fatalf("requests = %d, want 4", len(requests))
+	}
+	for _, request := range requests {
+		if !strings.HasPrefix(request.Path, leasePath) {
+			t.Errorf("%s %s is not under the lease path", request.Method, request.Path)
+		}
+		bearer(t, request, testLeaseToken)
+		if got := request.Header.Get("X-Appwrite-Project"); got != testProject {
+			t.Errorf("%s %s: X-Appwrite-Project = %q", request.Method, request.Path, got)
+		}
+		if got := request.Header.Get("X-Appwrite-Environment"); got != testRegion {
+			t.Errorf("%s %s: X-Appwrite-Environment = %q", request.Method, request.Path, got)
+		}
+	}
+}
+
+func TestSessionRejectsUnsafeQueryKeys(t *testing.T) {
+	server := newFake(t)
+	client := server.client(t)
+	for _, key := range []string{"key", "jwt", "mode", "Mode", "response-format", "Response-Format", "", "project id", "project\r\nOrigin", "projé"} {
+		lease := server.lease()
+		lease.Query = Map[string]{key: "value"}
+		if _, err := client.Session(Credentials{RunnerID: testRunnerID}, lease); err == nil {
+			t.Errorf("Session accepted query key %q", key)
+		}
+	}
+}
+
+func TestSessionValidatesLease(t *testing.T) {
+	client, err := New("https://cloud.example/v1", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials := Credentials{RunnerID: testRunnerID, Token: testRunnerKey}
+	valid := Lease{LeaseID: testLeaseID, Token: testLeaseToken, Endpoint: "https://fra.cloud.example/v1"}
+
+	if _, err := client.Session(credentials, valid); err != nil {
+		t.Errorf("Session(valid) = %v", err)
+	}
+	insecure := valid
+	insecure.Endpoint = "http://fra.cloud.example/v1"
+	if _, err := client.Session(credentials, insecure); err == nil {
+		t.Error("Session accepted an http lease endpoint without allowHTTP")
+	}
+	tokenless := valid
+	tokenless.Token = ""
+	if _, err := client.Session(credentials, tokenless); err == nil {
+		t.Error("Session accepted a lease without a token")
+	}
+	if _, err := client.Session(Credentials{}, valid); err == nil {
+		t.Error("Session accepted credentials without a runner id")
+	}
+}
+
+func TestExtendReportsCancel(t *testing.T) {
+	server := newFake(t)
+	server.handle("PATCH "+leasePath, func(writer http.ResponseWriter, _ *http.Request) {
+		respond(t, writer, http.StatusOK, map[string]any{"expiresAt": "2026-11-23T10:05:00.000+00:00", "canceled": true})
+	})
+
+	extension, err := server.session(t).Extend(context.Background())
+	if err != nil {
+		t.Fatalf("Extend: %v", err)
+	}
+
+	if !extension.Canceled {
+		t.Error("Canceled = false, want true")
+	}
+	if !extension.ExpiresAt.Equal(time.Date(2026, 11, 23, 10, 5, 0, 0, time.UTC)) {
+		t.Errorf("ExpiresAt = %v", extension.ExpiresAt)
+	}
+}
+
+func TestSourceDescriptor(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    map[string]any
+		valid   bool
+		headers int
+	}{
+		{"empty headers array", map[string]any{"url": "https://codeload.example/a.tar.gz", "headers": []string{}, "format": "tarball"}, true, 0},
+		{"headers object", map[string]any{"url": "https://bitbucket.example/a.tar.gz", "headers": map[string]string{"Authorization": "Bearer x"}, "format": "tarball"}, true, 1},
+		{"file url", map[string]any{"url": "file:///etc/passwd", "format": "tarball"}, false, 0},
+		{"no url", map[string]any{"format": "tarball"}, false, 0},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			server := newFake(t)
+			server.handle("GET "+leasePath+"/source", func(writer http.ResponseWriter, _ *http.Request) {
+				respond(t, writer, http.StatusOK, test.body)
+			})
+
+			source, err := server.session(t).Source(context.Background())
+
+			if (err == nil) != test.valid {
+				t.Fatalf("Source error = %v, want valid %v", err, test.valid)
+			}
+			if err != nil {
+				if strings.Contains(err.Error(), "passwd") {
+					t.Errorf("error leaks the url: %v", err)
+				}
+				return
+			}
+			if source.URL != test.body["url"] || source.Format != "tarball" || len(source.Headers) != test.headers {
+				t.Errorf("source = %#v (url %q)", source, source.URL)
+			}
+		})
+	}
+}
+
+func TestSourceRequiresHTTPS(t *testing.T) {
+	server := newFake(t)
+	server.handle("GET "+leasePath+"/source", func(writer http.ResponseWriter, _ *http.Request) {
+		respond(t, writer, http.StatusOK, map[string]any{"url": "http://codeload.example/a.tar.gz", "format": "tarball"})
+	})
+	session := server.session(t)
+	session.client.allowHTTP = false
+
+	if _, err := session.Source(context.Background()); err == nil {
+		t.Error("Source accepted an http url without allowHTTP")
+	}
+}
