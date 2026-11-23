@@ -102,8 +102,9 @@ unsigned() {
 import sys, zipfile
 names = zipfile.ZipFile(sys.argv[1]).namelist()
 signatures = [
-    name for name in names
-    if name.startswith("META-INF/") and "/" not in name[9:] and name.rsplit(".", 1)[-1] in ("SF", "RSA", "DSA", "EC")
+    name for name in (entry.upper() for entry in names)
+    if name.startswith("META-INF/") and "/" not in name[9:]
+    and (name.endswith((".SF", ".RSA", ".DSA", ".EC")) or name[9:].startswith("SIG-"))
 ]
 sys.exit(1 if signatures or "base/manifest/AndroidManifest.xml" not in names else 0)
 ' "/w/$2"
@@ -136,6 +137,9 @@ fi
 
 if docker image inspect "$tools" >/dev/null 2>&1; then
   tools_present=true
+elif [ "${CI:-}" = true ]; then
+  echo "tools image $tools is not built; run make tools (required when CI=true)" >&2
+  exit 1
 else
   tools_present=false
 fi
