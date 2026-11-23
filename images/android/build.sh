@@ -8,6 +8,7 @@ readonly width=16384
 readonly transcript_bytes=1048576
 readonly stale_minutes=60
 readonly stop_seconds=60
+readonly kill_seconds=10
 readonly fastlane_version=2.242.0
 readonly java_17=/opt/java/17
 readonly java_21=/opt/java/21
@@ -32,6 +33,7 @@ export CI=true
 gradle_version=''
 gradle_project=''
 temporary=()
+daemons=()
 
 info() {
   printf '[distribution] %s\n' "$*"
@@ -510,19 +512,52 @@ PYTHON
   commit "$output" "$DISTRIBUTION_OUTPUT_DIR/app-unsigned.aab"
 }
 
+find_daemons() {
+  local entry argument arguments=()
+  daemons=()
+  for entry in /proc/[0-9]*; do
+    { mapfile -d '' arguments < "$entry/cmdline"; } 2> /dev/null || continue
+    for argument in "${arguments[@]}"; do
+      case $argument in
+        org.gradle.launcher.daemon.bootstrap.GradleDaemon | worker.org.gradle.process.internal.worker.GradleWorkerMain | org.jetbrains.kotlin.daemon.KotlinCompileDaemon)
+          daemons+=("${entry#/proc/}")
+          break
+          ;;
+      esac
+    done
+  done
+}
+
+await_daemons() {
+  local deadline=$((SECONDS + $1))
+  find_daemons
+  while (( ${#daemons[@]} && SECONDS < deadline )); do
+    sleep 0.2
+    find_daemons
+  done
+  (( ${#daemons[@]} == 0 ))
+}
+
 stop_daemons() {
+  local started=$SECONDS
   if [[ -n $gradle_project && -x $gradle_project/gradlew ]]; then
     (cd "$gradle_project" && timeout -k 5 "$stop_seconds" ./gradlew --stop --quiet) > /dev/null 2>&1 || true
   fi
+  if await_daemons $((stop_seconds - (SECONDS - started))); then
+    return 0
+  fi
+  info "cache: killing daemons that outlived gradlew --stop: ${daemons[*]}"
+  kill -KILL -- "${daemons[@]}" 2> /dev/null || true
+  await_daemons "$kill_seconds"
 }
 
 save_cache() {
-  local artifact directory image path roots=()
+  local artifact directory image list path roots=()
   artifact=$(cache_artifact)
   if [[ -z $artifact ]]; then
     return 0
   fi
-  stop_daemons
+  stop_daemons || return 1
   for path in gradle/caches gradle/wrapper pub npm; do
     if [[ -e $home/$path ]]; then
       roots+=("$path")
@@ -535,10 +570,11 @@ save_cache() {
   directory=$(dirname "$artifact")
   mkdir -p "$directory" || return 1
   temporary_file image "$directory" "$(basename "$artifact")" || return 1
+  temporary_file list "$directory" "$(basename "$artifact")" || return 1
   info "cache: saving ${roots[*]}"
   (cd "$home" \
-    && find "${roots[@]}" \( -name '*.lock' -o -name '*.jks' -o -name '*.keystore' -o -name '*.p12' -o -name '*.pfx' \) -prune -o -print0 \
-    | mksquashfs - "$image" -cpiostyle0 -noappend -no-xattrs -no-progress -quiet -comp zstd -Xcompression-level 3) || return 1
+    && find "${roots[@]}" \( -name '*.lock' -o -name '*.jks' -o -name '*.keystore' -o -name '*.p12' -o -name '*.pfx' \) -prune -o -print0 > "$list" \
+    && mksquashfs - "$image" -cpiostyle0 -noappend -no-xattrs -no-progress -quiet -comp zstd -Xcompression-level 3 < "$list") || return 1
   commit "$image" "$artifact" || return 1
   info "cache: saved $artifact"
 }

@@ -147,6 +147,7 @@ PYTHON
 
 check_cache() {
   local listing
+  expect_log 'cache: saved /mnt/code/cache/smoke.sqfs'
   [[ -f $workspace/cache/smoke.sqfs ]] || fail 'the cache was not saved'
   listing=$(inside unsquashfs -l /mnt/code/cache/smoke.sqfs)
   grep -q '^squashfs-root/gradle/caches/' <<< "$listing" || fail 'the cache has no gradle caches'
