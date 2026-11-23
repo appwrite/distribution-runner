@@ -62,9 +62,9 @@ random_secret() {
 }
 
 generate_keystore() {
-  local path=$1 type=$2 store_password=$3 key_password=$4
+  local path=$1 type=$2 store_password=$3 key_password=$4 algorithm=${5:-RSA} size=${6:-2048}
   STORE_PASSWORD_INPUT=$store_password KEY_PASSWORD_INPUT=$key_password \
-    keytool -genkeypair -storetype "$type" -keyalg RSA -keysize 2048 -alias upload -validity 10000 \
+    keytool -genkeypair -storetype "$type" -keyalg "$algorithm" -keysize "$size" -alias upload -validity 10000 \
     -dname 'CN=Distribution Test Upload Key' -keystore "$path" \
     -storepass:env STORE_PASSWORD_INPUT -keypass:env KEY_PASSWORD_INPUT >/dev/null 2>&1 </dev/null \
     || fail "keytool could not generate $path"
@@ -155,6 +155,7 @@ sign() {
 assert_bundle_consumed() {
   assert_missing "$WORKSPACE/signing/bundle.json"
   [ -z "$(ls -A "$SCRATCH")" ] || fail "temporary files left behind: $(ls -A "$SCRATCH")"
+  assert_no_secrets_directory
   local secret
   for secret in "${BUNDLE_SECRETS[@]}"; do
     [[ $output != *"$secret"* ]] || fail 'a signing secret appears in stdout'
@@ -186,8 +187,43 @@ assert_inspected() {
 }
 
 mint() {
-  local out=$1
+  local path=$1
   shift
   python3 -I "$TOOLS/test/mint-ipa.py" --identifier "$IPA_IDENTIFIER" --version-name 2.3 --version-code 7 \
-    "$@" --out "$out" >"$BATS_TEST_TMPDIR/mint.log" 2>&1 || fail "mint-ipa.py $* failed" "$(cat "$BATS_TEST_TMPDIR/mint.log")"
+    "$@" --out "$path" >"$BATS_TEST_TMPDIR/mint.log" 2>&1 || fail "mint-ipa.py $* failed" "$(cat "$BATS_TEST_TMPDIR/mint.log")"
+}
+
+secrets_directories() {
+  find /dev/shm -maxdepth 1 -name 'signing.*' 2>/dev/null
+}
+
+assert_no_secrets_directory() {
+  [ -z "$(secrets_directories)" ] || fail "secrets directories left behind: $(secrets_directories)"
+}
+
+shim() {
+  local name=$1 body=$2
+  SHIMS=$BATS_TEST_TMPDIR/shims
+  mkdir -p "$SHIMS"
+  printf '#!/bin/sh\nset -eu\nreal=%s\n%s\n' "$(command -v "$name")" "$body" >"$SHIMS/$name"
+  chmod 0755 "$SHIMS/$name"
+}
+
+verify_shim() {
+  shim jarsigner "case \" \$* \" in
+  *' -verify '*) \"\$real\" \"\$@\" | python3 -I $BATS_TEST_DIRNAME/tamper.py log $1 ;;
+  *) exec \"\$real\" \"\$@\" ;;
+esac"
+}
+
+running() {
+  local file
+  for file in /proc/[0-9]*/cmdline; do
+    [ "$(tr '\0' ' ' <"$file" 2>/dev/null)" != "$1 " ] || return 0
+  done
+  return 1
+}
+
+tamper() {
+  python3 -I "$BATS_TEST_DIRNAME/tamper.py" "$@" || fail "tamper.py $* failed"
 }
