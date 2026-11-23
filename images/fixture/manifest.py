@@ -7,7 +7,9 @@ from typing import NamedTuple
 
 MANIFEST_ENTRY = 'base/manifest/AndroidManifest.xml'
 ANDROID_NAMESPACE = 'http://schemas.android.com/apk/res/android'
-SIGNATURE_EXTENSIONS = ('SF', 'RSA', 'DSA', 'EC')
+SIGNATURE_DIRECTORY = 'META-INF/'
+SIGNATURE_EXTENSIONS = ('.SF', '.RSA', '.DSA', '.EC')
+SIGNATURE_PREFIX = 'SIG-'
 VERSION_CODE_MAX = 2_100_000_000
 VERSION_NAME_MAX = 255
 
@@ -68,12 +70,12 @@ def read_varint(data: bytes, position: int) -> tuple[int, int]:
 def write_varint(value: int) -> bytes:
     if value < 0:
         value += 1 << 64
-    out = bytearray()
+    encoded = bytearray()
     while value >= 0x80:
-        out.append((value & 0x7F) | 0x80)
+        encoded.append((value & 0x7F) | 0x80)
         value >>= 7
-    out.append(value)
-    return bytes(out)
+    encoded.append(value)
+    return bytes(encoded)
 
 
 def decode(data: bytes) -> list[Field]:
@@ -104,19 +106,19 @@ def decode(data: bytes) -> list[Field]:
 
 
 def encode(fields: list[Field]) -> bytes:
-    out = bytearray()
+    encoded = bytearray()
     for field in fields:
         if field.raw is not None:
-            out += field.raw
+            encoded += field.raw
             continue
-        out += write_varint(field.number << 3 | field.wire)
+        encoded += write_varint(field.number << 3 | field.wire)
         if field.wire == WIRE_VARINT:
-            out += write_varint(field.value)
+            encoded += write_varint(field.value)
         elif field.wire == WIRE_LENGTH:
-            out += write_varint(len(field.value)) + field.value
+            encoded += write_varint(len(field.value)) + field.value
         else:
-            out += field.value
-    return bytes(out)
+            encoded += field.value
+    return bytes(encoded)
 
 
 def first(fields: list[Field], number: int) -> Field | None:
@@ -258,12 +260,11 @@ def identifier_value(value: str) -> str:
 
 
 def is_signature(name: str) -> bool:
-    if not name.startswith('META-INF/'):
+    name = name.upper()
+    if not name.startswith(SIGNATURE_DIRECTORY):
         return False
-    file = name[len('META-INF/'):]
-    if '/' in file or '.' not in file:
-        return False
-    return file.rsplit('.', 1)[1] in SIGNATURE_EXTENSIONS
+    file = name[len(SIGNATURE_DIRECTORY):]
+    return '/' not in file and (file.endswith(SIGNATURE_EXTENSIONS) or file.startswith(SIGNATURE_PREFIX))
 
 
 def assert_unsigned(bundle: zipfile.ZipFile) -> None:

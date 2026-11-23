@@ -44,7 +44,7 @@ An empty value is treated exactly like an unset one. When all three identity val
 | 0 | Bundle and `result.json` written |
 | 1 | Unexpected failure |
 | 2 | Invalid input: an identifier that is not at least two dot-separated segments, each starting with a letter and otherwise letters, digits or underscores; a version code that is not an integer from 1 to 2100000000; a version name that is not 1 to 255 printable characters; a knob that is not a non-negative integer |
-| 3 | The bundle is signed (never expected; the same check as the Android image) |
+| 3 | The bundle is signed (never expected): a top-level `META-INF/` entry, compared case-insensitively, ending in `.SF`, `.RSA`, `.DSA` or `.EC`, or starting with `SIG-`. This is the same rule as the tools image's sign and inspect jobs; before it was case-sensitive and ignored `SIG-` entries |
 | `FIXTURE_EXIT_CODE` | The requested failure |
 | 143 | Stopped with `SIGTERM` (130 for `SIGINT`) |
 
@@ -67,4 +67,4 @@ Their names avoid the `DISTRIBUTION_` and `APPWRITE_` prefixes, which the server
 
 Regenerate it with `make fixture-generate`, which runs `generate.sh` in a pinned `linux/amd64` Debian container: it downloads aapt2, the `platforms;android-36` `android.jar` and bundletool with pinned checksums, links the manifest in proto format, builds the bundle twice to confirm it is deterministic, checks that it is unsigned and passes `bundletool validate`, and reads the manifest back. Only `app-unsigned.aab` and `provenance.json` are committed. If `aapt2` cannot run under emulation, dispatch the `Fixture` workflow on an amd64 runner (see the root README).
 
-`tests/fixture.sh` (`make test-fixture`) covers this contract.
+`tests/fixture.sh` (`make test-fixture`) covers this contract. It also reads each rewritten bundle back with the tools image's bundletool and signs one with `sign-android.sh`; locally those checks are skipped when the tools image is missing, and with `CI=true` the suite fails instead.
