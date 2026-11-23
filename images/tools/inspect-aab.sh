@@ -1,79 +1,85 @@
 #!/bin/sh
 set -eu
 
-file="$1"
+EXIT_MALFORMED=2
+EXIT_INVALID=3
+EXIT_USAGE=4
+EXIT_TIMEOUT=8
+EXIT_INTERRUPTED=130
+EXIT_TERMINATED=143
+TIMED_OUT=124
+KILLED=137
+KILL_AFTER_SECONDS=10
 
+home=$(cd "$(dirname "$0")" && pwd)
+file="$1"
+signatures="$2"
+java_seconds="${DISTRIBUTION_MAX_JAVA_SECONDS:-600}"
+
+exec 3>&2
 work=$(mktemp -d)
+child=''
+interrupt() {
+  [ -z "$child" ] || kill "$child" 2>/dev/null || true
+  exit "$1"
+}
 trap 'rm -rf "$work"' EXIT
+trap 'interrupt $EXIT_TERMINATED' TERM
+trap 'interrupt $EXIT_INTERRUPTED' INT
 
 fail() {
-  echo "inspect-aab.sh: $2" >&2
+  echo "inspect-aab.sh: $2" >&3
   exit "$1"
 }
 
-manifest() {
-  bundletool dump manifest --bundle "$file" --xpath "$1" 2>>"$work/bundletool.log" \
-    || { cat "$work/bundletool.log" >&2; fail 2 'cannot read the bundle manifest'; }
+run() {
+  "$@" 3>&- &
+  child=$!
+  status=0
+  wait "$child" || status=$?
+  child=''
+  return "$status"
 }
 
-identifier=$(manifest '/manifest/@package')
-version_code=$(manifest '/manifest/@android:versionCode')
-version_name=$(manifest '/manifest/@android:versionName')
-min_sdk=$(manifest '/manifest/uses-sdk/@android:minSdkVersion')
-target_sdk=$(manifest '/manifest/uses-sdk/@android:targetSdkVersion')
+run_java() {
+  status=0
+  run timeout --kill-after="$KILL_AFTER_SECONDS" "$java_seconds" "$@" || status=$?
+  case "$status" in
+    "$TIMED_OUT" | "$KILLED") fail "$EXIT_TIMEOUT" "$1 ran longer than $java_seconds seconds" ;;
+  esac
+  return "$status"
+}
 
-signatures=$(python3 -I - "$file" <<'PYTHON'
-import sys
-import zipfile
+case "$java_seconds" in
+  '' | 0* | *[!0-9]*) fail "$EXIT_USAGE" "DISTRIBUTION_MAX_JAVA_SECONDS must be a positive integer, got '$java_seconds'" ;;
+esac
 
-SIGNATURE_EXTENSIONS = ('.SF', '.RSA', '.DSA', '.EC')
-
-with zipfile.ZipFile(sys.argv[1]) as archive:
-    names = [name.upper() for name in archive.namelist()]
-print(sum(
-    1 for name in names
-    if name.startswith('META-INF/') and '/' not in name[9:]
-    and (name.endswith(SIGNATURE_EXTENSIONS) or name[9:].startswith('SIG-'))
-))
-PYTHON
-)
+run_java bundletool dump manifest --bundle "$file" >"$work/manifest.xml" 2>"$work/bundletool.log" \
+  || { cat "$work/bundletool.log" >&2; fail "$EXIT_MALFORMED" 'cannot read the bundle manifest'; }
+run python3 -I "$home/manifest.py" --exit "$EXIT_MALFORMED" "$work/manifest.xml" >"$work/manifest.json" || exit $?
 
 signed=false
 fingerprint=''
 if [ "$signatures" != 0 ]; then
-  jarsigner -verify "$file" >"$work/verify.log" 2>&1 || true
-  if ! grep -qFx 'jar verified.' "$work/verify.log" || grep -qF 'unsigned entries' "$work/verify.log"; then
-    tail -n 20 "$work/verify.log" >&2
-    fail 3 'signature present but does not verify'
-  fi
+  run_java jarsigner -verify -verbose -certs "$file" >"$work/verify.log" 2>&1 || true
+  run python3 -I "$home/signature.py" --exit "$EXIT_INVALID" "$work/verify.log" || exit $?
+  run_java keytool -printcert -jarfile "$file" >"$work/signer.txt" 2>&1 \
+    || fail "$EXIT_INVALID" 'signature present but no readable signer certificate'
+  fingerprint=$(grep -F 'SHA256:' "$work/signer.txt" | head -n 1 | cut -d: -f2- | tr -d ' :' | tr 'A-F' 'a-f')
+  [ -n "$fingerprint" ] || fail "$EXIT_INVALID" 'signature present but no signer certificate'
   signed=true
-  fingerprint=$(keytool -printcert -jarfile "$file" | grep -F 'SHA256:' | head -n 1 | cut -d: -f2- | tr -d ' :' | tr 'A-F' 'a-f')
-  [ -n "$fingerprint" ] || fail 3 'signature present but no signer certificate'
 fi
 
-python3 -I - "$identifier" "$version_name" "$version_code" "$min_sdk" "$target_sdk" "$signed" "$fingerprint" <<'PYTHON'
+python3 -I - "$work/manifest.json" "$signed" "$fingerprint" <<'PYTHON'
 import json
 import sys
 
-identifier, version_name, version_code, min_sdk, target_sdk, signed, fingerprint = sys.argv[1:]
-
-
-def integer(name, value, required):
-    if not value and not required:
-        return None
-    if not (value.isascii() and value.isdigit()):
-        print(f'inspect-aab.sh: {name} is {value!r}, not an integer', file=sys.stderr)
-        sys.exit(2)
-    return int(value)
-
-
+manifest_path, signed, fingerprint = sys.argv[1:]
+with open(manifest_path, encoding='utf-8') as handle:
+    manifest = json.load(handle)
 print(json.dumps({
     'type': 'aab',
-    'identifier': identifier or None,
-    'versionName': version_name or None,
-    'versionCode': integer('versionCode', version_code, True),
-    'minSdk': integer('minSdk', min_sdk, False),
-    'targetSdk': integer('targetSdk', target_sdk, False),
+    **manifest,
     'signed': signed == 'true',
     'fingerprint': fingerprint or None,
 }))

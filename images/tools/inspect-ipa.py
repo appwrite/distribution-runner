@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""Inspects an uploaded .ipa without extracting it. Run by inspect.sh after its archive checks.
-
-usage: python3 -I inspect-ipa.py <file.ipa>
-env: DISTRIBUTION_TRUST (PEM bundle the provisioning profile must chain to)
-exit: 2 malformed, 3 invalid signature, profile or team
-"""
 import base64
 import datetime
 import hashlib
@@ -16,8 +10,14 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from typing import NamedTuple
 
-TRUST = os.environ.get('DISTRIBUTION_TRUST') or '/usr/local/distribution/certificates/trust.pem'
+HOME = os.path.dirname(os.path.abspath(__file__))
+TRUST = os.path.join(HOME, 'certificates', 'trust.pem')
+TEST_STAGE = os.path.join(HOME, 'test')
+
+PROFILE_SIGNER_SUBJECT = 'C=US,O=Apple Inc.,CN=Apple iPhone OS Provisioning Profile Signing'
+PROFILE_SIGNER_ISSUER = 'C=US,O=Apple Inc.,OU=Certification Authority,CN=Apple iPhone Certification Authority'
 
 MAX_PLIST_BYTES = 1 << 20
 MAX_PROFILE_BYTES = 1 << 20
@@ -34,13 +34,19 @@ CODE_SIGNATURE_COMMAND = 0x1D
 SUPERBLOB_MAGIC = 0xFADE0CC0
 CODE_DIRECTORY_MAGIC = 0xFADE0C02
 ENTITLEMENTS_MAGIC = 0xFADE7171
+DER_ENTITLEMENTS_MAGIC = 0xFADE7172
 CMS_MAGIC = 0xFADE0B01
 CODE_DIRECTORY_SLOT = 0
+INFO_SLOT = 1
 ENTITLEMENTS_SLOT = 5
+DER_ENTITLEMENTS_SLOT = 7
 CMS_SLOT = 0x10000
+BLOB_HEADER_BYTES = 8
+CODE_DIRECTORY_HEADER_BYTES = 40
 ADHOC_FLAG = 0x2
 TEAM_VERSION = 0x20200
 TEAM_OFFSET = 48
+HASHES = {1: ('sha1', 20), 2: ('sha256', 32), 3: ('sha256', 20), 4: ('sha384', 48)}
 
 PEM_BEGIN = '-----BEGIN CERTIFICATE-----'
 PEM_END = '-----END CERTIFICATE-----'
@@ -52,6 +58,17 @@ class Malformed(Exception):
 
 class Invalid(Exception):
     code = 3
+
+
+class Directory(NamedTuple):
+    blob: bytes
+    adhoc: bool
+    team: str | None
+    identifier: str
+    hash_type: int
+    hash_offset: int
+    hash_size: int
+    special_count: int
 
 
 class Stream:
@@ -73,6 +90,11 @@ class Stream:
             self.read(min(CHUNK_BYTES, offset - self.position))
 
 
+def trust():
+    override = os.environ.get('DISTRIBUTION_TRUST')
+    return override if override and os.path.isdir(TEST_STAGE) else TRUST
+
+
 def bounded(archive, name, limit):
     try:
         info = archive.getinfo(name)
@@ -88,7 +110,6 @@ def bounded(archive, name, limit):
 
 
 def code_signature(stream):
-    """Returns the first slice's LC_CODE_SIGNATURE bytes, or None when the executable is unsigned."""
     head = stream.read(4)
     base = 0
     if struct.unpack('>I', head)[0] in (FAT_MAGIC, FAT_MAGIC_64):
@@ -136,32 +157,82 @@ def superblob(data):
     slots = {}
     for index in range(count):
         slot, offset = struct.unpack_from('>II', data, 12 + index * 8)
-        if offset + 8 > len(data):
+        if offset + BLOB_HEADER_BYTES > len(data):
             raise Invalid('code signature blob overruns the signature')
         magic, length = struct.unpack_from('>II', data, offset)
-        if length < 8 or offset + length > len(data):
+        if length < BLOB_HEADER_BYTES or offset + length > len(data):
             raise Invalid('code signature blob overruns the signature')
+        if slot in slots:
+            raise Invalid(f'code signature has two blobs in slot {slot}')
         slots[slot] = (magic, data[offset:offset + length])
     return slots
 
 
+def c_string(blob, offset, name):
+    end = blob.find(b'\0', offset)
+    if offset >= len(blob) or end < 0:
+        raise Invalid(f'CodeDirectory {name} overruns the blob')
+    try:
+        return blob[offset:end].decode('ascii')
+    except UnicodeDecodeError:
+        raise Invalid(f'CodeDirectory {name} is not ASCII') from None
+
+
 def code_directory(blob):
-    """Returns (adhoc, team) from a CodeDirectory blob."""
-    if len(blob) < 16:
+    if len(blob) < CODE_DIRECTORY_HEADER_BYTES:
         raise Invalid('CodeDirectory is truncated')
-    version, flags = struct.unpack_from('>II', blob, 8)
+    version, flags, hash_offset, identity_offset, special_count, _, _, hash_size, hash_type = struct.unpack_from(
+        '>7I2B', blob, 8,
+    )
     team = None
     if version >= TEAM_VERSION and len(blob) >= TEAM_OFFSET + 4:
         offset = struct.unpack_from('>I', blob, TEAM_OFFSET)[0]
         if offset:
-            end = blob.find(b'\0', offset)
-            if offset >= len(blob) or end < 0:
-                raise Invalid('CodeDirectory team identifier overruns the blob')
-            try:
-                team = blob[offset:end].decode('ascii')
-            except UnicodeDecodeError:
-                raise Invalid('CodeDirectory team identifier is not ASCII') from None
-    return bool(flags & ADHOC_FLAG), team
+            team = c_string(blob, offset, 'team identifier')
+    return Directory(
+        blob, bool(flags & ADHOC_FLAG), team, c_string(blob, identity_offset, 'identifier'),
+        hash_type, hash_offset, hash_size, special_count,
+    )
+
+
+def special_hash(directory, slot):
+    if slot > directory.special_count:
+        return None
+    start = directory.hash_offset - slot * directory.hash_size
+    if start < 0 or directory.hash_offset > len(directory.blob):
+        raise Invalid('CodeDirectory special slots overrun the blob')
+    value = directory.blob[start:start + directory.hash_size]
+    return None if value == bytes(directory.hash_size) else value
+
+
+def digest(directory, data):
+    name, size = HASHES[directory.hash_type]
+    return hashlib.new(name, data).digest()[:size]
+
+
+def bind(directory, slots, info_data, info):
+    if directory.hash_type not in HASHES or HASHES[directory.hash_type][1] != directory.hash_size:
+        raise Invalid(f'CodeDirectory hash type {directory.hash_type} with size {directory.hash_size} is not supported')
+    if directory.identifier != text(info, 'CFBundleIdentifier'):
+        raise Invalid(
+            f'CodeDirectory identifier {directory.identifier} does not match CFBundleIdentifier {text(info, "CFBundleIdentifier")}',
+        )
+    if special_hash(directory, INFO_SLOT) != digest(directory, info_data):
+        raise Invalid('the code signature does not seal this Info.plist')
+    for slot, magic, name in (
+        (ENTITLEMENTS_SLOT, ENTITLEMENTS_MAGIC, 'entitlements'),
+        (DER_ENTITLEMENTS_SLOT, DER_ENTITLEMENTS_MAGIC, 'DER entitlements'),
+    ):
+        sealed = special_hash(directory, slot)
+        found, blob = slots.get(slot, (None, None))
+        if blob is None:
+            if sealed is not None:
+                raise Invalid(f'the code signature seals {name} that are missing')
+            continue
+        if found != magic:
+            raise Invalid(f'code signature slot {slot} does not hold {name}')
+        if sealed != digest(directory, blob):
+            raise Invalid(f'the code signature does not seal these {name}')
 
 
 def property_list(data, error, reason):
@@ -179,19 +250,26 @@ def openssl(arguments, reason):
     if completed.returncode != 0:
         sys.stderr.write(completed.stderr.decode(errors='replace'))
         raise Invalid(reason)
+    return completed.stdout.decode(errors='replace')
 
 
-def certificate(pem):
-    text = pem.decode('ascii', errors='replace')
+def only_certificate(path, what):
+    with open(path, 'rb') as handle:
+        text = handle.read().decode('ascii', errors='replace')
+    certificates = []
     start = text.find(PEM_BEGIN)
-    end = text.find(PEM_END, start)
-    if start < 0 or end < 0:
-        raise Invalid('code signature CMS has no signer certificate')
-    return base64.b64decode(''.join(text[start + len(PEM_BEGIN):end].split()))
+    while start >= 0:
+        end = text.find(PEM_END, start)
+        if end < 0:
+            break
+        certificates.append(base64.b64decode(''.join(text[start + len(PEM_BEGIN):end].split())))
+        start = text.find(PEM_BEGIN, end)
+    if len(certificates) != 1:
+        raise Invalid(f'{what} must have exactly one signer, found {len(certificates)}')
+    return certificates[0]
 
 
 def signer(cms, content, directory):
-    """Verifies the detached CMS signature over the CodeDirectory and returns the signer certificate (DER)."""
     paths = {name: os.path.join(directory, name) for name in ('signature.der', 'directory.bin', 'signer.pem')}
     with open(paths['signature.der'], 'wb') as handle:
         handle.write(cms)
@@ -202,20 +280,28 @@ def signer(cms, content, directory):
          '-content', paths['directory.bin'], '-noverify', '-signer', paths['signer.pem'], '-out', os.devnull],
         'code signature CMS does not verify over the CodeDirectory',
     )
-    with open(paths['signer.pem'], 'rb') as handle:
-        return certificate(handle.read())
+    return only_certificate(paths['signer.pem'], 'code signature CMS')
 
 
 def profile(data, directory):
     envelope = os.path.join(directory, 'profile.der')
     content = os.path.join(directory, 'profile.plist')
+    profile_signer = os.path.join(directory, 'profile-signer.pem')
     with open(envelope, 'wb') as handle:
         handle.write(data)
+    anchors = trust()
     openssl(
         ['cms', '-verify', '-inform', 'der', '-in', envelope, '-binary',
-         '-CAfile', TRUST, '-purpose', 'any', '-out', content],
-        f'provisioning profile does not verify against {TRUST}',
+         '-CAfile', anchors, '-purpose', 'any', '-signer', profile_signer, '-out', content],
+        f'provisioning profile does not verify against {anchors}',
     )
+    only_certificate(profile_signer, 'provisioning profile')
+    names = openssl(
+        ['x509', '-in', profile_signer, '-noout', '-subject', '-issuer', '-nameopt', 'RFC2253'],
+        'provisioning profile signer certificate is unreadable',
+    )
+    if names != f'subject={PROFILE_SIGNER_SUBJECT}\nissuer={PROFILE_SIGNER_ISSUER}\n':
+        raise Invalid(f"provisioning profile is not signed by Apple's profile signing certificate: {' '.join(names.split())}")
     with open(content, 'rb') as handle:
         parsed = property_list(handle.read(MAX_PROFILE_BYTES + 1), Invalid, 'provisioning profile is not a property list')
     teams = parsed.get('TeamIdentifier')
@@ -227,6 +313,27 @@ def profile(data, directory):
     if not isinstance(certificates, list) or not all(isinstance(entry, bytes) for entry in certificates):
         raise Invalid('provisioning profile has no DeveloperCertificates')
     return parsed
+
+
+def covers(pattern, identifier):
+    return pattern == identifier or (pattern.endswith('*') and identifier.startswith(pattern[:-1]))
+
+
+def application_identifier(provision, team, identifier, entitlements):
+    granted = provision.get('Entitlements')
+    value = granted.get('application-identifier') if isinstance(granted, dict) else None
+    if not isinstance(value, str) or '.' not in value:
+        raise Invalid('provisioning profile has no application-identifier entitlement')
+    prefix, pattern = value.split('.', 1)
+    prefixes = provision.get('ApplicationIdentifierPrefix')
+    allowed = {team, *(prefixes if isinstance(prefixes, list) else [])}
+    if prefix not in allowed:
+        raise Invalid(f'provisioning profile application-identifier {value} does not belong to team {team}')
+    if not covers(pattern, identifier):
+        raise Invalid(f'provisioning profile application-identifier {value} does not cover {identifier}')
+    claimed = (entitlements or {}).get('application-identifier')
+    if claimed is not None and claimed != f'{prefix}.{identifier}':
+        raise Invalid(f'signed application-identifier {claimed} does not match {prefix}.{identifier}')
 
 
 def text(info, key):
@@ -253,7 +360,8 @@ def inspect(path, directory):
             raise Malformed(f'expected exactly one Payload/*.app, found {len(apps)}')
         root = f'Payload/{apps[0]}/'
 
-        info = property_list(bounded(archive, root + 'Info.plist', MAX_PLIST_BYTES), Malformed, 'Info.plist is not a property list')
+        info_data = bounded(archive, root + 'Info.plist', MAX_PLIST_BYTES)
+        info = property_list(info_data, Malformed, 'Info.plist is not a property list')
         executable = text(info, 'CFBundleExecutable')
         if not executable or '/' in executable or executable in ('.', '..'):
             raise Malformed('Info.plist has no valid CFBundleExecutable')
@@ -268,25 +376,29 @@ def inspect(path, directory):
             magic, directory_blob = slots.get(CODE_DIRECTORY_SLOT, (None, b''))
             if magic != CODE_DIRECTORY_MAGIC:
                 raise Invalid('code signature has no CodeDirectory')
-            adhoc, team = code_directory(directory_blob)
+            code = code_directory(directory_blob)
+            adhoc, team = code.adhoc, code.team
             magic, blob = slots.get(ENTITLEMENTS_SLOT, (None, b''))
             if magic == ENTITLEMENTS_MAGIC:
-                entitlements = property_list(blob[8:], Invalid, 'entitlements are not a property list')
+                entitlements = property_list(blob[BLOB_HEADER_BYTES:], Invalid, 'entitlements are not a property list')
             magic, blob = slots.get(CMS_SLOT, (None, b''))
-            cms = blob[8:] if magic == CMS_MAGIC else b''
+            cms = blob[BLOB_HEADER_BYTES:] if magic == CMS_MAGIC else b''
             if not adhoc:
                 if not cms:
                     raise Invalid('signature is not ad hoc but carries no CMS signature')
+                bind(code, slots, info_data, info)
                 leaf = signer(cms, directory_blob, directory)
 
         provision = None
         if root + 'embedded.mobileprovision' in names:
             provision = profile(bounded(archive, root + 'embedded.mobileprovision', MAX_PROFILE_BYTES), directory)
             if leaf is not None:
-                if team != provision['TeamIdentifier'][0]:
-                    raise Invalid(f'code signature team {team} does not match profile team {provision["TeamIdentifier"][0]}')
+                profile_team = provision['TeamIdentifier'][0]
+                if team != profile_team:
+                    raise Invalid(f'code signature team {team} does not match profile team {profile_team}')
                 if leaf not in provision['DeveloperCertificates']:
-                    raise Invalid('code signing certificate is not one of the profile\'s DeveloperCertificates')
+                    raise Invalid("code signing certificate is not one of the profile's DeveloperCertificates")
+                application_identifier(provision, team, text(info, 'CFBundleIdentifier'), entitlements)
 
     return {
         'type': 'ipa',
@@ -310,9 +422,9 @@ def main(path):
     except (Malformed, Invalid) as error:
         print(f'inspect-ipa.py: {error}', file=sys.stderr)
         sys.exit(error.code)
-    except (OSError, EOFError, zipfile.BadZipFile, struct.error, ValueError) as error:
-        print(f'inspect-ipa.py: malformed archive: {error}', file=sys.stderr)
-        sys.exit(2)
+    except Exception as error:
+        print(f'inspect-ipa.py: malformed archive: {type(error).__name__}: {error}', file=sys.stderr)
+        sys.exit(Malformed.code)
     print(json.dumps(result, default=serialise))
 
 

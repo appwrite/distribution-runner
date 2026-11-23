@@ -1,10 +1,6 @@
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS base
 
-ARG VERSION=dev
-
-ENV DISTRIBUTION_IMAGE=appwrite/distribution-tools:${VERSION} \
-    DISTRIBUTION_HOME=/usr/local/distribution \
-    LANG=C.UTF-8 \
+ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8
 
 SHELL ["/bin/bash", "-eu", "-o", "pipefail", "-c"]
@@ -16,11 +12,10 @@ RUN apt-get update \
         openjdk-21-jdk-headless \
         openssl \
         python3 \
-        unzip \
     && rm -rf /var/lib/apt/lists/* \
     && java -version 2>&1 | head -1 | grep -qF '"21.' \
-    && command -v jarsigner keytool \
-    && python3 -I -c 'import base64, hashlib, json, plistlib, struct, subprocess, zipfile'
+    && command -v jarsigner keytool timeout \
+    && python3 -I -c 'import argparse, base64, hashlib, json, plistlib, struct, subprocess, xml.etree.ElementTree, zipfile'
 
 ADD --checksum=sha256:a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29 --chmod=0644 \
     https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar \
@@ -43,16 +38,19 @@ RUN chmod 0755 /usr/local/distribution /usr/local/distribution/certificates \
     && cp apple.pem trust.pem \
     && chmod 0644 apple.pem trust.pem
 
-COPY --chmod=0755 sign-android.sh inspect.sh inspect-aab.sh inspect-ipa.py /usr/local/distribution/
+COPY --chmod=0755 sign-android.sh inspect.sh inspect-aab.sh inspect-ipa.py archive.py bundle.py manifest.py signature.py \
+    /usr/local/distribution/
 WORKDIR /mnt/code
 
 FROM base AS test
 
-COPY test/ca.pem test/ca.key test/mint-ipa.py test/README.md /usr/local/distribution/test/
-RUN chmod 0755 /usr/local/distribution/test /usr/local/distribution/test/mint-ipa.py \
-    && chmod 0644 /usr/local/distribution/test/ca.pem /usr/local/distribution/test/ca.key /usr/local/distribution/test/README.md \
-    && openssl x509 -in /usr/local/distribution/test/ca.pem -noout \
-    && cat /usr/local/distribution/certificates/apple.pem /usr/local/distribution/test/ca.pem \
-        > /usr/local/distribution/certificates/trust.pem
+COPY test/ca.pem test/ca.key test/profile-ca.pem test/profile-signer.pem test/profile-signer.key test/mint-ipa.py test/README.md \
+    /usr/local/distribution/test/
+WORKDIR /usr/local/distribution/test
+RUN chmod 0755 . mint-ipa.py \
+    && chmod 0644 ca.pem ca.key profile-ca.pem profile-signer.pem profile-signer.key README.md \
+    && openssl verify -CAfile ca.pem -untrusted profile-ca.pem profile-signer.pem \
+    && cat ../certificates/apple.pem ca.pem > ../certificates/trust.pem
+WORKDIR /mnt/code
 
 FROM base AS release

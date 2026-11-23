@@ -2,256 +2,151 @@
 set -eu
 umask 077
 
+EXIT_REFUSED=3
+EXIT_ALREADY_SIGNED=4
+EXIT_SIGNING=5
+EXIT_VERIFICATION=6
+EXIT_USAGE=7
+EXIT_TIMEOUT=8
+EXIT_INTERRUPTED=130
+EXIT_TERMINATED=143
+TIMED_OUT=124
+KILLED=137
+KILL_AFTER_SECONDS=10
+
+home=$(cd "$(dirname "$0")" && pwd)
 workspace="${DISTRIBUTION_WORKSPACE:-/mnt/code}"
 bundle="$workspace/signing/bundle.json"
 input="${DISTRIBUTION_INPUT:-$workspace/input/app-unsigned.aab}"
 output="$workspace/output"
+java_seconds="${DISTRIBUTION_MAX_JAVA_SECONDS:-600}"
 
-secrets=$(mktemp -d)
+exec 3>&2
+secrets=$(mktemp -d /dev/shm/signing.XXXXXX 2>/dev/null) || secrets=$(mktemp -d)
+work=$(mktemp -d)
 staged=''
+child=''
 cleanup() {
-  rm -rf "$secrets"
+  rm -rf "$secrets" "$work"
   [ -z "$staged" ] || rm -f "$staged"
 }
+interrupt() {
+  [ -z "$child" ] || kill "$child" 2>/dev/null || true
+  exit "$1"
+}
 trap cleanup EXIT
-trap 'exit 143' TERM
-trap 'exit 130' INT
+trap 'interrupt $EXIT_TERMINATED' TERM
+trap 'interrupt $EXIT_INTERRUPTED' INT
 
 fail() {
-  echo "sign-android.sh: $2" >&2
+  echo "sign-android.sh: $2" >&3
   exit "$1"
 }
 
-python3 -I - "$bundle" "$secrets" <<'PYTHON' || exit 7
-import base64
-import binascii
-import json
-import os
-import sys
+run() {
+  "$@" 3>&- &
+  child=$!
+  status=0
+  wait "$child" || status=$?
+  child=''
+  return "$status"
+}
 
-KEYS = ('keystore', 'storePassword', 'keyAlias', 'keyPassword')
+run_java() {
+  status=0
+  run timeout --kill-after="$KILL_AFTER_SECONDS" "$java_seconds" "$@" || status=$?
+  case "$status" in
+    "$TIMED_OUT" | "$KILLED") fail "$EXIT_TIMEOUT" "$1 ran longer than $java_seconds seconds" ;;
+  esac
+  return "$status"
+}
 
-
-def refuse(reason):
-    print(f'sign-android.sh: signing bundle {reason}', file=sys.stderr)
-    sys.exit(7)
-
-
-def consume(path):
-    try:
-        with open(path, 'rb') as handle:
-            return handle.read()
-    except OSError:
-        return None
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
-def parse(raw):
-    try:
-        document = json.loads(raw)
-    except ValueError:
-        refuse('is not valid JSON')
-    if not isinstance(document, dict) or sorted(document) != sorted(KEYS):
-        refuse('must have exactly the keys ' + ', '.join(KEYS))
-    for key in KEYS:
-        if not isinstance(document[key], str) or not document[key]:
-            refuse(f'{key} must be a non-empty string')
-    for key in ('storePassword', 'keyPassword', 'keyAlias'):
-        if any(character in document[key] for character in '\r\n\0'):
-            refuse(f'{key} must be a single line')
-    if document['keyAlias'].startswith('-'):
-        refuse('keyAlias must not start with a hyphen')
-    try:
-        keystore = base64.b64decode(document['keystore'], validate=True)
-    except binascii.Error:
-        refuse('keystore is not valid base64')
-    if not keystore:
-        refuse('keystore is empty')
-    return {
-        'keystore': keystore,
-        'store-password': document['storePassword'].encode(),
-        'key-password': document['keyPassword'].encode(),
-        'alias': document['keyAlias'].encode(),
-    }
-
-
-def main(path, directory):
-    raw = consume(path)
-    if raw is None:
-        refuse(f'{path} is missing')
-    for name, content in parse(raw).items():
-        descriptor = os.open(os.path.join(directory, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, 'wb') as handle:
-            handle.write(content)
-
-
-try:
-    main(*sys.argv[1:])
-except SystemExit:
-    raise
-except Exception:
-    refuse('could not be read')
-PYTHON
+run python3 -I "$home/bundle.py" "$bundle" "$secrets" || exit "$EXIT_USAGE"
 
 identifier="${DISTRIBUTION_IDENTIFIER:-}"
 version_code="${DISTRIBUTION_VERSION_CODE:-}"
-[ -n "$identifier" ] || fail 7 'DISTRIBUTION_IDENTIFIER is required'
+[ -n "$identifier" ] || fail "$EXIT_USAGE" 'DISTRIBUTION_IDENTIFIER is required'
 case "$version_code" in
-  '' | *[!0-9]*) fail 7 'DISTRIBUTION_VERSION_CODE must be a positive integer' ;;
+  '' | 0* | *[!0-9]*) fail "$EXIT_USAGE" "DISTRIBUTION_VERSION_CODE must be a positive integer without leading zeros, got '$version_code'" ;;
 esac
-[ -f "$input" ] || fail 7 "input bundle $input not found"
+case "$java_seconds" in
+  '' | 0* | *[!0-9]*) fail "$EXIT_USAGE" "DISTRIBUTION_MAX_JAVA_SECONDS must be a positive integer, got '$java_seconds'" ;;
+esac
+[ -f "$input" ] || fail "$EXIT_USAGE" "input bundle $input not found"
 
-python3 -I - "$input" <<'PYTHON' || exit $?
-import os
-import sys
-import zipfile
+run python3 -I "$home/archive.py" --malformed "$EXIT_REFUSED" --usage "$EXIT_USAGE" --type aab "$input" >"$work/signatures" \
+  || exit $?
+[ "$(cat "$work/signatures")" = 0 ] || fail "$EXIT_ALREADY_SIGNED" 'refusing to sign: the bundle already carries a signature'
 
-SIGNATURE_EXTENSIONS = ('.SF', '.RSA', '.DSA', '.EC')
-
-path = sys.argv[1]
-max_entries = int(os.environ.get('MAX_ENTRIES') or 100_000)
-max_uncompressed_bytes = int(os.environ.get('MAX_UNCOMPRESSED_BYTES') or 16_000_000_000)
-
-
-def refuse(code, reason):
-    print(f'sign-android.sh: refusing to sign: {reason}', file=sys.stderr)
-    sys.exit(code)
-
-
-try:
-    with zipfile.ZipFile(path) as archive:
-        entries = archive.infolist()
-except (OSError, zipfile.BadZipFile):
-    refuse(3, 'input is not a readable zip archive')
-if len(entries) > max_entries:
-    refuse(3, f'too many entries: {len(entries)}')
-if len({entry.filename for entry in entries}) != len(entries):
-    refuse(3, 'duplicate entry names')
-if sum(entry.file_size for entry in entries) > max_uncompressed_bytes:
-    refuse(3, 'uncompressed size too large')
-for entry in entries:
-    name = entry.filename.upper()
-    if not name.startswith('META-INF/') or '/' in name[9:]:
-        continue
-    if name.endswith(SIGNATURE_EXTENSIONS) or name[9:].startswith('SIG-'):
-        refuse(4, 'bundle already carries a signature')
-PYTHON
-
-manifest() {
-  bundletool dump manifest --bundle "$input" --xpath "$1" 2>>"$secrets/bundletool.log" \
-    || { cat "$secrets/bundletool.log" >&2; fail 3 'refusing to sign: cannot read the bundle manifest'; }
-}
-
-level() {
-  case "$2" in
-    *[!0-9]*) fail 3 "refusing to sign: $1 is '$2', not an API level" ;;
-  esac
-}
-
-found_identifier=$(manifest '/manifest/@package')
-found_version_code=$(manifest '/manifest/@android:versionCode')
-version_name=$(manifest '/manifest/@android:versionName')
-min_sdk=$(manifest '/manifest/uses-sdk/@android:minSdkVersion')
-target_sdk=$(manifest '/manifest/uses-sdk/@android:targetSdkVersion')
-level minSdk "$min_sdk"
-level targetSdk "$target_sdk"
-
-if [ "$found_identifier" != "$identifier" ]; then
-  fail 3 "refusing to sign: package is '$found_identifier', expected '$identifier'"
-fi
-if [ "$found_version_code" != "$version_code" ]; then
-  fail 3 "refusing to sign: versionCode is '$found_version_code', expected '$version_code'"
-fi
+run_java bundletool dump manifest --bundle "$input" >"$work/manifest.xml" 2>"$work/bundletool.log" \
+  || { cat "$work/bundletool.log" >&2; fail "$EXIT_REFUSED" 'refusing to sign: cannot read the bundle manifest'; }
+run python3 -I "$home/manifest.py" --exit "$EXIT_REFUSED" --identifier "$identifier" --version-code "$version_code" \
+  "$work/manifest.xml" >"$work/manifest.json" || exit $?
 
 alias=$(cat "$secrets/alias")
-
-listing=$(keytool -list -v -keystore "$secrets/keystore" -storepass:file "$secrets/store-password" -alias "$alias" 2>&1) \
-  || { printf '%s\n' "$listing" >&2; fail 5 'cannot read the keystore with the given store password and alias'; }
-algorithm=$(printf '%s\n' "$listing" | grep -F 'Subject Public Key Algorithm' | head -n 1) || true
-case "$algorithm" in
-  *RSA*) signature=SHA256withRSA ;;
-  *EC*) signature=SHA256withECDSA ;;
-  *) fail 5 "unsupported upload key: ${algorithm:-no key entry for the alias}" ;;
+certificate="$secrets/certificate.pem"
+run_java keytool -exportcert -rfc -keystore "$secrets/keystore" -storepass:file "$secrets/store-password" \
+  -alias "$alias" -file "$certificate" >"$work/keytool.log" 2>&1 \
+  || { cat "$work/keytool.log" >&2; fail "$EXIT_SIGNING" 'cannot read the keystore with the given store password and alias'; }
+openssl x509 -in "$certificate" -noout -text >"$work/certificate.txt" 2>&1 \
+  || fail "$EXIT_SIGNING" 'cannot read the signing certificate'
+case "$(grep -F 'Public Key Algorithm:' "$work/certificate.txt" | head -n 1)" in
+  *rsaEncryption*) signature=SHA256withRSA ;;
+  *id-ecPublicKey*) signature=SHA256withECDSA ;;
+  *) fail "$EXIT_SIGNING" 'unsupported upload key: only RSA and EC keys are supported' ;;
 esac
+certificate_fingerprint=$(openssl x509 -in "$certificate" -noout -fingerprint -sha256) \
+  || fail "$EXIT_SIGNING" 'cannot read the signing certificate fingerprint'
+certificate_fingerprint=$(echo "${certificate_fingerprint#*=}" | tr -d ':' | tr 'A-F' 'a-f')
+not_after=$(openssl x509 -in "$certificate" -noout -enddate -dateopt iso_8601) \
+  || fail "$EXIT_SIGNING" 'cannot read the signing certificate expiry'
+not_after="${not_after#notAfter=}"
 
 mkdir -p "$output"
+chmod 0755 "$output"
 staged="$output/.app.aab.partial"
-jarsigner -keystore "$secrets/keystore" \
+run_java jarsigner -keystore "$secrets/keystore" \
   -storepass:file "$secrets/store-password" -keypass:file "$secrets/key-password" \
   -sigalg "$signature" -digestalg SHA-256 \
-  -signedjar "$staged" "$input" "$alias" >"$secrets/sign.log" 2>&1 \
-  || { cat "$secrets/sign.log" >&2; fail 5 'jarsigner failed to sign the bundle'; }
-grep -qFx 'jar signed.' "$secrets/sign.log" || { cat "$secrets/sign.log" >&2; fail 5 'jarsigner did not sign the bundle'; }
+  -signedjar "$staged" "$input" "$alias" >"$work/sign.log" 2>&1 \
+  || { cat "$work/sign.log" >&2; fail "$EXIT_SIGNING" 'jarsigner failed to sign the bundle'; }
+grep -qFx 'jar signed.' "$work/sign.log" || { cat "$work/sign.log" >&2; fail "$EXIT_SIGNING" 'jarsigner did not sign the bundle'; }
 
-jarsigner -verify -verbose -certs "$staged" >"$secrets/verify.log" 2>&1 || true
-unverified() {
-  tail -n 20 "$secrets/verify.log" >&2
-  fail 6 "signed bundle does not verify: $1"
-}
-summary() {
-  signers=0
-  digest_algorithm=''
-  signature_algorithm=''
-  while IFS= read -r line; do
-    case "$line" in
-      '- Signed by '*) signers=$((signers + 1)) ;;
-      '    Digest algorithm: '*) [ "$signers" = 0 ] || digest_algorithm="${line#    Digest algorithm: }" ;;
-      '    Signature algorithm: '*) [ "$signers" = 0 ] || signature_algorithm="${line#    Signature algorithm: }" ;;
-    esac
-  done <"$secrets/verify.log"
-}
-summary
-grep -qFx 'jar verified.' "$secrets/verify.log" || unverified 'jarsigner did not report jar verified.'
-[ "$signers" = 1 ] || unverified "expected exactly one signer, found $signers"
-[ "$digest_algorithm" = SHA-256 ] || unverified "digest algorithm is '$digest_algorithm', expected SHA-256"
-case "$signature_algorithm" in
-  "$signature, "*) ;;
-  *) unverified "signature algorithm is '$signature_algorithm', expected $signature" ;;
-esac
-if grep -qF 'unsigned entries' "$secrets/verify.log"; then
-  unverified 'bundle contains unsigned entries'
-fi
+run_java jarsigner -verify -verbose -certs "$staged" >"$work/verify.log" 2>&1 || true
+run python3 -I "$home/signature.py" --exit "$EXIT_VERIFICATION" --digest SHA-256 --algorithm "$signature" "$work/verify.log" \
+  || exit $?
 
-fingerprint=$(keytool -printcert -jarfile "$staged" | grep -F 'SHA256:' | head -n 1 | cut -d: -f2- | tr -d ' :' | tr 'A-F' 'a-f')
-keytool -exportcert -rfc -keystore "$secrets/keystore" -storepass:file "$secrets/store-password" \
-  -alias "$alias" -file "$secrets/certificate.pem" >/dev/null 2>&1 \
-  || fail 6 'cannot export the signing certificate from the keystore'
-certificate_fingerprint=$(openssl x509 -in "$secrets/certificate.pem" -noout -fingerprint -sha256) \
-  || fail 6 'cannot read the signing certificate'
-certificate_fingerprint=$(echo "${certificate_fingerprint#*=}" | tr -d ':' | tr 'A-F' 'a-f')
-not_after=$(openssl x509 -in "$secrets/certificate.pem" -noout -enddate -dateopt iso_8601) \
-  || fail 6 'cannot read the signing certificate expiry'
-not_after="${not_after#notAfter=}"
+run_java keytool -printcert -jarfile "$staged" >"$work/signer.txt" 2>&1 \
+  || { cat "$work/signer.txt" >&2; fail "$EXIT_VERIFICATION" 'cannot read the signer certificate of the signed bundle'; }
+fingerprint=$(grep -F 'SHA256:' "$work/signer.txt" | head -n 1 | cut -d: -f2- | tr -d ' :' | tr 'A-F' 'a-f')
 [ -n "$fingerprint" ] && [ "$fingerprint" = "$certificate_fingerprint" ] \
-  || fail 6 'the bundle signer does not match the keystore certificate'
+  || fail "$EXIT_VERIFICATION" 'the bundle signer does not match the keystore certificate'
 
 mv "$staged" "$output/app.aab"
 staged=''
-digest=$(sha256sum "$output/app.aab" | cut -d' ' -f1)
+run sha256sum "$output/app.aab" >"$work/digest"
+digest=$(cut -d' ' -f1 "$work/digest")
 
-python3 -I - "$output/result.json" "$digest" "$fingerprint" "$identifier" "$version_name" \
-  "$version_code" "$min_sdk" "$target_sdk" "$not_after" <<'PYTHON'
+python3 -I - "$work/manifest.json" "$output/result.json" "$digest" "$fingerprint" "$not_after" <<'PYTHON'
 import datetime
 import json
 import os
 import sys
 
-path, digest, fingerprint, identifier, version_name, version_code, min_sdk, target_sdk, not_after = sys.argv[1:]
+manifest_path, path, digest, fingerprint, not_after = sys.argv[1:]
+with open(manifest_path, encoding='utf-8') as handle:
+    manifest = json.load(handle)
 expires = datetime.datetime.strptime(not_after, '%Y-%m-%d %H:%M:%SZ')
 result = {
     'artifact': 'app.aab',
     'type': 'aab',
     'digest': digest,
     'fingerprint': fingerprint,
-    'identifier': identifier,
-    'versionName': version_name,
-    'versionCode': int(version_code),
-    'minSdk': int(min_sdk) if min_sdk else None,
-    'targetSdk': int(target_sdk) if target_sdk else None,
+    'identifier': manifest['identifier'],
+    'versionName': manifest['versionName'],
+    'versionCode': manifest['versionCode'],
+    'minSdk': manifest['minSdk'],
+    'targetSdk': manifest['targetSdk'],
     'expiresAt': expires.strftime('%Y-%m-%dT%H:%M:%SZ'),
 }
 partial = os.path.join(os.path.dirname(path), '.result.json.partial')
