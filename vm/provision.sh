@@ -244,12 +244,27 @@ check_signing_state() {
   done
 }
 
-# lock_account gives the guest user a random password nobody keeps and takes it out of admin, so build code cannot
-# become root to read another machine's secrets or reconfigure the guest. The autologin password file is rewritten to
-# match, and the login keychain, encrypted with the old password, is removed for macOS to recreate at the next login.
-# This is the last step that needs sudo: afterwards the image has no admin account.
+# revoke_sudo runs as root with the guest user as $1: it removes every sudoers.d file that names the user, takes the user
+# out of admin and prints what sudo still lets the user run, which must be nothing.
+# shellcheck disable=SC2016 # expanded by the root shell, which gets the user as $1
+readonly revoke_sudo='
+for file in /etc/sudoers.d/*; do
+  if [ -f "$file" ] && /usr/bin/grep -q -w -e "$1" -- "$file"; then
+    /bin/rm -f -- "$file"
+  fi
+done
+/usr/sbin/dseditgroup -o edit -d "$1" -t user admin
+/usr/bin/dscacheutil -flushcache
+/usr/bin/sudo -l -U "$1" 2>&1 || true
+'
+
+# lock_account gives the guest user a random password nobody keeps and takes away every sudo right it has, through
+# admin or a sudoers.d entry, so build code cannot become root to read another machine's secrets or reconfigure the
+# guest. The autologin password file is rewritten to match, and the login keychain, encrypted with the old password,
+# is removed for macOS to recreate at the next login. This is the last step that needs sudo: afterwards the image has
+# no account that can use it.
 lock_account() {
-  local password membership
+  local password membership privileges
   info "account: $user gets a random password and leaves the admin group"
   password=$(/usr/bin/openssl rand -hex 32)
   sudo /usr/bin/dscl . -passwd "/Users/$user" "$password"
@@ -264,11 +279,14 @@ sys.stdout.buffer.write(bytes(byte ^ key[index % len(key)] for index, byte in en
   sudo /usr/sbin/chown root:wheel /etc/kcpassword
   sudo /bin/chmod 0600 /etc/kcpassword
   rm -f -- "$HOME/Library/Keychains/login.keychain-db"
-  sudo /usr/sbin/dseditgroup -o edit -d "$user" -t user admin
+  privileges=$(sudo /bin/sh -c "$revoke_sudo" sh "$user")
   sudo -k
   membership=$(/usr/sbin/dseditgroup -o checkmember -m "$user" admin) || true
   if [[ $membership != *'NOT a member'* ]]; then
     fail "$user is still an admin: $membership"
+  fi
+  if [[ $privileges != *"User $user is not allowed to run sudo"* ]]; then
+    fail "$user can still use sudo: $privileges"
   fi
 }
 
@@ -298,7 +316,7 @@ main() {
   lock_account
   info "image: $IMAGE"
   info "labels: $(paste -sd , "$home/labels")"
-  info 'done: the image has no admin account and no ssh host key of its own; stop it now'
+  info 'done: the image has no account that can use sudo, and the agent trusts only the host key it mints per clone; stop it now'
 }
 
 main "$@"
