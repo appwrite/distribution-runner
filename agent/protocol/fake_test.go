@@ -49,7 +49,8 @@ func newFake(t *testing.T) *fake {
 func (f *fake) serve(writer http.ResponseWriter, request *http.Request) {
 	body, err := io.ReadAll(request.Body)
 	if err != nil {
-		f.t.Errorf("read body: %v", err)
+		// The client abandoned the request mid-body, as Upload does to its other chunks once one is rejected.
+		return
 	}
 	for _, name := range forbiddenHeaders {
 		if values, ok := request.Header[http.CanonicalHeaderKey(name)]; ok {
