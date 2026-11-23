@@ -1,0 +1,6 @@
+*
+!Gemfile
+!Gemfile.lock
+!build.sh
+!distribution.init.gradle
+!fastlane/Fastfile
