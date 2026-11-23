@@ -1,0 +1,2 @@
+# Exceptions to the Trivy gate, changed only through a pull request.
+# Each entry is a comment line with the reason, then `CVE-ID exp:YYYY-MM-DD` on the next line.

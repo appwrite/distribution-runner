@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.aab binary
+*.ipa binary
+*.cer binary
+*.jar binary

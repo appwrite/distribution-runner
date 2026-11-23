@@ -1,0 +1,190 @@
+name: Images
+
+on:
+  push:
+    branches: [main]
+    tags: ['[0-9]+.[0-9]+.[0-9]+']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: make lint
+
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      tools: ${{ steps.diff.outputs.tools }}
+      fixture: ${{ steps.diff.outputs.fixture }}
+      android: ${{ steps.diff.outputs.android }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: diff
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          files=$(git diff --name-only "origin/$BASE...HEAD")
+          tools=false
+          fixture=false
+          android=false
+          while IFS= read -r file; do
+            case "$file" in
+              .github/workflows/images.yml|Makefile|.trivyignore) tools=true fixture=true android=true ;;
+            esac
+            case "$file" in
+              images/tools/*|images/fixture/*|tests/Dockerfile|tests/*.bats|tests/helpers.bash) tools=true ;;
+            esac
+            case "$file" in
+              images/fixture/*|images/tools/*|tests/fixture.sh) fixture=true ;;
+            esac
+            case "$file" in
+              images/android/*|tests/android.sh) android=true ;;
+            esac
+          done <<< "$files"
+          {
+            echo "tools=$tools"
+            echo "fixture=$fixture"
+            echo "android=$android"
+          } >> "$GITHUB_OUTPUT"
+          echo "changed: tools=$tools fixture=$fixture android=$android"
+
+  build:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.result != 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: tools
+            build: tools tools-test
+            platforms: linux/amd64,linux/arm64
+            target: release
+          - image: fixture
+            build: tools fixture
+            platforms: linux/amd64,linux/arm64
+            target: ''
+          - image: android
+            build: android
+            platforms: linux/amd64
+            target: ''
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: detect
+        env:
+          IMAGE: ${{ matrix.image }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          CHANGED: ${{ needs.changes.outputs[matrix.image] }}
+        run: |
+          enabled=false
+          publish=false
+          if [ ! -f "images/$IMAGE/Dockerfile" ]; then
+            echo "skip: images/$IMAGE/Dockerfile not found"
+          elif [ "$EVENT" = push ] || [ "$CHANGED" = true ]; then
+            enabled=true
+          else
+            echo "skip: no changes affect $IMAGE"
+          fi
+          if [ "$enabled" = true ] && [ "$EVENT" = push ] && [ "${REF#refs/tags/}" != "$REF" ] && [ -n "$DOCKERHUB_USERNAME" ]; then
+            publish=true
+          fi
+          {
+            echo "enabled=$enabled"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare disk
+        if: steps.detect.outputs.enabled == 'true' && matrix.image == 'android'
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/lib/android /usr/share/swift /opt/hostedtoolcache/CodeQL
+          if [ ! -d /mnt ]; then
+            echo '::error::/mnt is missing, the android build needs the runner scratch disk'
+            exit 1
+          fi
+          available=$(df --output=avail -k /mnt | tail -n 1)
+          minimum=$((40 * 1024 * 1024))
+          if [ "$available" -lt "$minimum" ]; then
+            echo "::error::/mnt has ${available} KiB free, the android build needs at least ${minimum} KiB"
+            exit 1
+          fi
+          config=/etc/docker/daemon.json
+          current='{}'
+          if sudo test -s "$config"; then
+            current=$(sudo cat "$config")
+          fi
+          jq '. + {"data-root": "/mnt/docker"}' <<< "$current" | sudo tee "$config" > /dev/null
+          sudo systemctl restart docker
+          root=$(docker info --format '{{.DockerRootDir}}')
+          if [ "$root" != /mnt/docker ]; then
+            echo "::error::docker data root is $root, expected /mnt/docker"
+            exit 1
+          fi
+          sudo mkdir -p /mnt/trivy /mnt/tmp
+          sudo chown "$(id -u):$(id -g)" /mnt/trivy /mnt/tmp
+          {
+            echo 'TRIVY_CACHE_DIR=/mnt/trivy'
+            echo 'TRIVY_TMP=/mnt/tmp'
+          } >> "$GITHUB_ENV"
+          df -h / /mnt
+
+      - name: Build
+        if: steps.detect.outputs.enabled == 'true'
+        run: |
+          make ${{ matrix.build }}
+          df -h / /mnt
+
+      - name: Scan
+        if: steps.detect.outputs.enabled == 'true'
+        run: |
+          make scan-${{ matrix.image }}
+          df -h / /mnt
+
+      - name: Test
+        if: steps.detect.outputs.enabled == 'true'
+        run: make test-${{ matrix.image }}
+
+      - if: steps.detect.outputs.publish == 'true'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - if: steps.detect.outputs.publish == 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - if: steps.detect.outputs.publish == 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publish
+        if: steps.detect.outputs.publish == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: images/${{ matrix.image }}
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.platforms }}
+          build-args: VERSION=${{ github.ref_name }}
+          tags: appwrite/distribution-${{ matrix.image }}:${{ github.ref_name }}
+          push: true

@@ -1,0 +1,85 @@
+name: Agent
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - agent/**
+      - Makefile
+      - .trivyignore
+      - .github/workflows/agent.yml
+  pull_request:
+    paths:
+      - agent/**
+      - Makefile
+      - .trivyignore
+      - .github/workflows/agent.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AGENT_PLATFORMS: darwin/arm64 darwin/amd64 linux/amd64
+      GOTESTFLAGS: -race
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: detect
+        run: |
+          if [ -f agent/go.mod ]; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'skip: agent/go.mod not found'
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.detect.outputs.enabled == 'true'
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: agent/go.mod
+          cache: false
+
+      - name: Test
+        if: steps.detect.outputs.enabled == 'true'
+        run: make test-agent
+
+      - name: Build
+        if: steps.detect.outputs.enabled == 'true'
+        run: make agent
+
+      - name: Assert static
+        if: steps.detect.outputs.enabled == 'true'
+        run: |
+          for binary in agent/bin/distribution-agent-*; do
+            if ! go version -m "$binary" | grep -qF 'CGO_ENABLED=0'; then
+              echo "::error::$binary was not built with CGO_ENABLED=0"
+              exit 1
+            fi
+          done
+          description=$(file agent/bin/distribution-agent-linux-amd64)
+          echo "$description"
+          if [ "${description#*statically linked}" = "$description" ]; then
+            echo '::error::agent/bin/distribution-agent-linux-amd64 is not statically linked'
+            exit 1
+          fi
+
+      - name: Scan
+        if: steps.detect.outputs.enabled == 'true'
+        run: make scan-agent
+
+      - if: steps.detect.outputs.enabled == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: distribution-agent
+          path: agent/bin/
+          if-no-files-found: error
