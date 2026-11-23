@@ -1,6 +1,8 @@
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 ARG VERSION=dev
+ARG DEBIAN_FRONTEND=noninteractive
+ARG FASTLANE_VERSION=2.242.0
 
 ARG JAVA_17_URL=https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.21.1%2B2/OpenJDK17U-jdk_x64_linux_hotspot_17.0.21.1_2.tar.gz
 ARG JAVA_17_SHA256=0b0ac5eab6db6abaec68c9913bcddb31321e5da411c45073d520d9c125e6f7b4
@@ -10,17 +12,16 @@ ARG CMDLINE_TOOLS_URL=https://dl.google.com/android/repository/commandlinetools-
 ARG CMDLINE_TOOLS_SHA256=4e4c464f145a7512b57d088ac6c278c03c9eea610886b35a5e0804e74eedf583
 ARG NODE_URL=https://nodejs.org/dist/v26.13.1/node-v26.13.1-linux-x64.tar.xz
 ARG NODE_SHA256=5c063e46bab0fbc1c17cc445d7ff129cbdcd0471be6ed83b6ab864f8143bc864
+ARG COREPACK_URL=https://registry.npmjs.org/corepack/-/corepack-0.36.0.tgz
+ARG COREPACK_SHA256=9128cfe26aee0c99f4fc68c15c6b8b12309a68be0de2c012cdfea2a463cb722f
 ARG FLUTTER_URL=https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_3.41.2-stable.tar.xz
 ARG FLUTTER_SHA256=4a04f8a6152986d14fc137ffaf98106ca743c0f9ab66f1bc2f20ee84eb573e5c
 ARG BUNDLETOOL_URL=https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar
 ARG BUNDLETOOL_SHA256=a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29
 
 ENV DISTRIBUTION_IMAGE=appwrite/distribution-android:${VERSION} \
-    FASTLANE_VERSION=2.242.0 \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
-    JAVA_17_HOME=/opt/java/17 \
-    JAVA_21_HOME=/opt/java/21 \
     JAVA_HOME=/opt/java/21 \
     ANDROID_HOME=/opt/android-sdk \
     ANDROID_SDK_ROOT=/opt/android-sdk \
@@ -50,12 +51,12 @@ RUN curl -fsSL --retry 3 -o /tmp/java-17.tar.gz "$JAVA_17_URL" \
     && echo "$JAVA_17_SHA256  /tmp/java-17.tar.gz" | sha256sum -c - \
     && curl -fsSL --retry 3 -o /tmp/java-21.tar.gz "$JAVA_21_URL" \
     && echo "$JAVA_21_SHA256  /tmp/java-21.tar.gz" | sha256sum -c - \
-    && mkdir -p "$JAVA_17_HOME" "$JAVA_21_HOME" \
-    && tar -xzf /tmp/java-17.tar.gz -C "$JAVA_17_HOME" --strip-components=1 \
-    && tar -xzf /tmp/java-21.tar.gz -C "$JAVA_21_HOME" --strip-components=1 \
-    && rm -f /tmp/java-17.tar.gz /tmp/java-21.tar.gz "$JAVA_17_HOME/lib/src.zip" "$JAVA_21_HOME/lib/src.zip" \
-    && "$JAVA_17_HOME/bin/java" -version \
-    && "$JAVA_21_HOME/bin/java" -version
+    && mkdir -p /opt/java/17 /opt/java/21 \
+    && tar -xzf /tmp/java-17.tar.gz -C /opt/java/17 --strip-components=1 \
+    && tar -xzf /tmp/java-21.tar.gz -C /opt/java/21 --strip-components=1 \
+    && rm -f /tmp/java-17.tar.gz /tmp/java-21.tar.gz /opt/java/17/lib/src.zip /opt/java/21/lib/src.zip \
+    && /opt/java/17/bin/java -version \
+    && /opt/java/21/bin/java -version
 
 RUN curl -fsSL --retry 3 -o /tmp/cmdline-tools.zip "$CMDLINE_TOOLS_URL" \
     && echo "$CMDLINE_TOOLS_SHA256  /tmp/cmdline-tools.zip" | sha256sum -c - \
@@ -71,15 +72,18 @@ RUN curl -fsSL --retry 3 -o /tmp/cmdline-tools.zip "$CMDLINE_TOOLS_URL" \
         'platforms;android-37.0' \
         'build-tools;35.0.0' \
         'build-tools;37.0.0' \
+        'cmake;3.22.1' \
         'ndk;27.1.12297006' \
         'ndk;28.2.13676358' \
         > /dev/null \
     && sdkmanager --list_installed \
-        | awk -F '|' 'NF == 4 { gsub(/ /, "", $1); gsub(/ /, "", $2); print $1 "=" $2 }' \
+        | tr -d ' ' \
+        | awk -F '|' 'NF == 4 { print $1 "=" $2 }' \
         | sort > /tmp/installed \
     && printf '%s\n' \
         'build-tools;35.0.0=35.0.0' \
         'build-tools;37.0.0=37.0.0' \
+        'cmake;3.22.1=3.22.1' \
         'ndk;27.1.12297006=27.1.12297006' \
         'ndk;28.2.13676358=28.2.13676358' \
         'platform-tools=37.0.3' \
@@ -96,7 +100,13 @@ RUN curl -fsSL --retry 3 -o /tmp/node.tar.xz "$NODE_URL" \
     && tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1 \
     && rm -f /tmp/node.tar.xz \
     && node --version \
-    && npm --version
+    && npm --version \
+    && curl -fsSL --retry 3 -o /tmp/corepack.tgz "$COREPACK_URL" \
+    && echo "$COREPACK_SHA256  /tmp/corepack.tgz" | sha256sum -c - \
+    && npm install --global --offline --no-audit --no-fund /tmp/corepack.tgz \
+    && rm -f /tmp/corepack.tgz \
+    && corepack --version \
+    && command -v yarn pnpm
 
 RUN curl -fsSL --retry 3 -o /tmp/flutter.tar.xz "$FLUTTER_URL" \
     && echo "$FLUTTER_SHA256  /tmp/flutter.tar.xz" | sha256sum -c - \
@@ -105,7 +115,8 @@ RUN curl -fsSL --retry 3 -o /tmp/flutter.tar.xz "$FLUTTER_URL" \
     && flutter config --no-analytics \
     && dart --disable-analytics \
     && flutter precache --android \
-    && flutter --version
+    && flutter --version \
+    && test -s /opt/flutter/bin/cache/flutter.version.json
 
 RUN mkdir -p /opt/bundletool \
     && curl -fsSL --retry 3 -o /opt/bundletool/bundletool-all.jar "$BUNDLETOOL_URL" \
@@ -128,5 +139,10 @@ RUN apt-get update \
 
 COPY fastlane/Fastfile fastlane/Fastfile
 COPY distribution.init.gradle build.sh ./
+
+RUN grep -qxF "readonly fastlane_version=$FASTLANE_VERSION" build.sh \
+    && dpkg-divert --local --no-rename --divert /usr/bin/sh.distrib --add /usr/bin/sh \
+    && ln -sf bash /usr/bin/sh \
+    && sh -c 'test -n "$BASH_VERSION"'
 
 CMD ["/usr/local/distribution/build.sh"]

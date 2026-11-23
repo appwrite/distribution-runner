@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 shopt -s inherit_errexit
 
@@ -6,15 +6,27 @@ readonly workspace=/mnt/code
 readonly home=$workspace/.distribution
 readonly width=16384
 readonly transcript_bytes=1048576
+readonly stale_minutes=60
+readonly stop_seconds=60
+readonly fastlane_version=2.242.0
+readonly java_17=/opt/java/17
+readonly java_21=/opt/java/21
+readonly sdk=/opt/android-sdk
+readonly flutter_root=/opt/flutter
 
 export DISTRIBUTION_HOME=/usr/local/distribution
 export DISTRIBUTION_SOURCE=${DISTRIBUTION_SOURCE:-$workspace/source}
 export DISTRIBUTION_ROOT_DIRECTORY=${DISTRIBUTION_ROOT_DIRECTORY:-.}
 export DISTRIBUTION_OUTPUT_DIR=${DISTRIBUTION_OUTPUT_DIR:-$workspace/output}
+export ANDROID_HOME=$sdk
+export ANDROID_SDK_ROOT=$sdk
+export FLUTTER_ROOT=$flutter_root
+export PATH=$java_21/bin:$sdk/cmdline-tools/latest/bin:$sdk/platform-tools:/opt/node/bin:$flutter_root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export GRADLE_USER_HOME=$home/gradle
 export PUB_CACHE=$home/pub
 export npm_config_cache=$home/npm
 export ANDROID_USER_HOME=$home/android
+export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 export CI=true
 
 gradle_version=''
@@ -30,6 +42,15 @@ fail() {
   shift
   printf '[distribution] %s\n' "$*" >&2
   exit "$code"
+}
+
+failed() {
+  local status=$1 code=$1
+  shift
+  if (( code >= 2 && code <= 4 )); then
+    code=1
+  fi
+  fail "$code" "$*: failed with exit status $status"
 }
 
 cleanup() {
@@ -49,12 +70,42 @@ commit() {
   chmod 0644 -- "$1" && mv -f -- "$1" "$2"
 }
 
+sweep() {
+  local directory=$1 minutes=$2 name filter=()
+  shift 2
+  if [[ ! -d $directory ]]; then
+    return 0
+  fi
+  if (( minutes )); then
+    filter=(-mmin "+$minutes")
+  fi
+  for name in "$@"; do
+    find "$directory" -maxdepth 1 -type f -name ".$name.??????" "${filter[@]}" -delete
+  done
+}
+
 cache_artifact() {
   local path=${DISTRIBUTION_CACHE_ARTIFACT:-}
   if [[ -n $path && $path != /* ]]; then
     path=$workspace/$path
   fi
   printf '%s' "$path"
+}
+
+mount_point() {
+  local path=$1 point best=/
+  while read -r _ _ _ _ point _; do
+    if [[ $path == "$point" || $path == "$point"/* ]] && (( ${#point} > ${#best} )); then
+      best=$point
+    fi
+  done < /proc/self/mountinfo
+  printf '%s' "$best"
+}
+
+in_workspace() {
+  local path
+  path=$(realpath -e -- "$1") || return 1
+  [[ $path == "$workspace"/* && $(mount_point "$path") == "$(mount_point "$workspace")" ]]
 }
 
 require() {
@@ -64,6 +115,16 @@ require() {
       fail 2 "$name is required"
     fi
   done
+}
+
+sweep_temporary() {
+  local artifact
+  sweep "$DISTRIBUTION_OUTPUT_DIR" 0 app-unsigned.aab mapping.txt result.json
+  sweep "$workspace/output" 0 result.json
+  artifact=$(cache_artifact)
+  if [[ -n $artifact ]]; then
+    sweep "$(dirname "$artifact")" "$stale_minutes" "$(basename "$artifact")"
+  fi
 }
 
 restore_cache() {
@@ -82,6 +143,9 @@ restore_cache() {
     rm -rf "$home"
     mkdir -p "$home"
   fi
+  if in_workspace "$artifact"; then
+    rm -f -- "$artifact"
+  fi
 }
 
 resolve_root() {
@@ -90,6 +154,9 @@ resolve_root() {
   root=$(realpath -e -- "$source/$DISTRIBUTION_ROOT_DIRECTORY") || fail 2 "root directory $DISTRIBUTION_ROOT_DIRECTORY not found"
   if [[ $root != "$source" && $root != "$source"/* ]]; then
     fail 2 'root directory escapes the checkout'
+  fi
+  if [[ ${DISTRIBUTION_FRAMEWORK:-} == react-native && ! -d $root/android ]]; then
+    fail 2 'react-native: the root directory has no android directory'
   fi
   printf '%s' "$root"
 }
@@ -103,21 +170,37 @@ install_dependencies() {
   (cd "$root" && sh -c "$DISTRIBUTION_INSTALL_COMMAND")
 }
 
+wrapper_version() {
+  local line key value version
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    key=${line%%[=:]*}
+    key=${key//[[:space:]]/}
+    if [[ $key != distributionUrl || $line != *[=:]* ]]; then
+      continue
+    fi
+    value=${line#*[=:]}
+    if [[ $value != */gradle-* ]]; then
+      return 0
+    fi
+    version=${value##*/gradle-}
+    version=${version%-*}
+    if [[ $version == [0-9]*.* ]]; then
+      printf '%s' "$version"
+    fi
+    return 0
+  done < "$1"
+}
+
 detect_gradle() {
-  local root=$1 project properties url version
+  local root=$1 project properties
   for project in "$root" "$root/android"; do
     properties=$project/gradle/wrapper/gradle-wrapper.properties
     if [[ ! -f $properties ]]; then
       continue
     fi
-    url=$(grep -m 1 '^distributionUrl=' "$properties" || true)
-    url=${url%$'\r'}
-    version=${url##*/gradle-}
-    version=${version%-*}
     gradle_project=$project
-    if [[ $url == */gradle-* && $version == [0-9]*.* ]]; then
-      gradle_version=$version
-    fi
+    gradle_version=$(wrapper_version "$properties")
     return 0
   done
 }
@@ -125,28 +208,53 @@ detect_gradle() {
 select_java() {
   local version=$1 major rest minor
   if [[ -z $version ]]; then
-    printf '%s' "$JAVA_21_HOME"
+    printf '%s' "$java_21"
     return 0
   fi
   major=${version%%.*}
   rest=${version#*.}
   minor=${rest%%[!0-9]*}
   if [[ -z $major || $major == *[!0-9]* || -z $minor ]]; then
-    printf '%s' "$JAVA_21_HOME"
+    printf '%s' "$java_21"
   elif (( major < 8 || (major == 8 && minor < 5) )); then
-    printf '%s' "$JAVA_17_HOME"
+    printf '%s' "$java_17"
   else
-    printf '%s' "$JAVA_21_HOME"
+    printf '%s' "$java_21"
   fi
 }
 
-heap_megabytes() {
-  local limit=''
-  if [[ -r /sys/fs/cgroup/memory.max ]]; then
-    limit=$(< /sys/fs/cgroup/memory.max)
-  elif [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+memory_limit() {
+  local line path='' file value limit=''
+  if [[ -r /proc/self/cgroup ]]; then
+    while IFS= read -r line; do
+      if [[ $line == 0::* ]]; then
+        path=${line#0::}
+      fi
+    done < /proc/self/cgroup
+  fi
+  while [[ -n $path ]]; do
+    file=/sys/fs/cgroup${path%/}/memory.max
+    if [[ -r $file ]]; then
+      value=$(< "$file")
+      if [[ -n $value && $value != *[!0-9]* ]] && { [[ -z $limit ]] || (( value < limit )); }; then
+        limit=$value
+      fi
+    fi
+    if [[ $path == / ]]; then
+      break
+    fi
+    path=${path%/*}
+    path=${path:-/}
+  done
+  if [[ -z $limit && -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
     limit=$(< /sys/fs/cgroup/memory/memory.limit_in_bytes)
   fi
+  printf '%s' "$limit"
+}
+
+heap_megabytes() {
+  local limit
+  limit=$(memory_limit)
   if [[ -z $limit || $limit == *[!0-9]* ]] || (( limit > (1 << 50) )); then
     limit=$((8 << 30))
   fi
@@ -161,8 +269,12 @@ configure_gradle() {
   export JAVA_HOME=$java
   export PATH=$java/bin:$PATH
   mkdir -p "$GRADLE_USER_HOME/init.d" "$ANDROID_USER_HOME"
-  printf 'org.gradle.java.home=%s\norg.gradle.jvmargs=-Xmx%sm -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8\n' \
-    "$java" "$heap" > "$GRADLE_USER_HOME/gradle.properties"
+  cat > "$GRADLE_USER_HOME/gradle.properties" <<PROPERTIES
+org.gradle.java.home=$java
+org.gradle.java.installations.paths=$java_17,$java_21
+org.gradle.jvmargs=-Xmx${heap}m -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8
+kotlin.compiler.execution.strategy=in-process
+PROPERTIES
   cp "$DISTRIBUTION_HOME/distribution.init.gradle" "$GRADLE_USER_HOME/init.d/distribution.init.gradle"
   info "gradle: ${gradle_version:-unknown}, java: $java, heap: ${heap}m"
 }
@@ -174,6 +286,7 @@ import sys
 
 transcript, source = sys.argv[1], os.path.realpath(sys.argv[2])
 markers = ('keystore', 'key.properties', 'storefile', 'storepassword', 'keyalias', 'keypassword', 'signingconfig', '.jks')
+headers = ('Execution failed for task ', 'A problem occurred ')
 prefix = "Build file '"
 separator = "' line: "
 
@@ -199,19 +312,38 @@ def located(path, number):
 with open(transcript, encoding='utf-8', errors='replace') as handle:
     lines = [strip(line) for line in handle]
 
-evidence = []
-failure = False
+failures = []
+current = None
+section = None
 for line in lines:
+    if line == '* Where:':
+        current = {'where': '', 'wrong': []}
+        failures.append(current)
+        section = 'where'
+        continue
     if line.startswith('* What went wrong:'):
-        failure = True
+        if current is None or current['wrong']:
+            current = {'where': '', 'wrong': []}
+            failures.append(current)
+        section = 'wrong'
         continue
     if line.startswith('* '):
-        failure = False
-    if failure:
-        evidence.append(line)
-    if line.startswith(prefix) and separator in line:
+        section = None
+        current = None
+        continue
+    if section == 'where' and line.startswith(prefix) and separator in line:
         path, _, number = line[len(prefix):].partition(separator)
-        evidence.append(located(path, number.strip()))
+        current['where'] = located(path, number.strip())
+    elif section == 'wrong' and line:
+        current['wrong'].append(line)
+
+evidence = []
+for failure in failures:
+    wrong = failure['wrong']
+    if wrong and wrong[0].startswith('Script compilation error'):
+        continue
+    evidence.append(failure['where'])
+    evidence.extend(line for line in wrong if not line.startswith(headers))
 
 text = '\n'.join(evidence).lower()
 sys.exit(0 if any(marker in text for marker in markers) else 1)
@@ -234,7 +366,7 @@ run_lane() {
   if keystore_required "$transcript"; then
     fail 4 'build_keystore_required: your build script requires a keystore file; guard it or remove the signing config'
   fi
-  fail "$status" "build: failed with exit status $status"
+  failed "$status" build
 }
 
 locate_bundle() {
@@ -269,7 +401,7 @@ except (OSError, zipfile.BadZipFile) as error:
     sys.exit(f'[distribution] the bundle is not a readable zip: {error}')
 signed = [
     name for name in names
-    if name.startswith('META-INF/') and name.count('/') == 1 and name.upper().endswith(extensions)
+    if name.upper().startswith('META-INF/') and name.count('/') == 1 and name.upper().endswith(extensions)
 ]
 sys.exit(3 if signed else 0)
 PYTHON
@@ -281,44 +413,50 @@ PYTHON
 }
 
 manifest() {
-  bundletool dump manifest --bundle "$1" --xpath "$2"
+  bundletool dump manifest --bundle "$1" --xpath "$2" || fail 2 'build: the bundle has no readable manifest'
 }
 
-flutter_version() {
-  if [[ ${DISTRIBUTION_FRAMEWORK:-} != flutter ]]; then
-    return 0
+assert_identity() {
+  local identifier=$1 code=$2
+  if [[ -n ${DISTRIBUTION_IDENTIFIER:-} && $identifier != "$DISTRIBUTION_IDENTIFIER" ]]; then
+    fail 2 "build: the bundle package is $identifier, expected $DISTRIBUTION_IDENTIFIER"
   fi
-  flutter --version --machine 2>/dev/null \
-    | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["frameworkVersion"])' 2>/dev/null \
-    || true
+  if [[ -n ${DISTRIBUTION_VERSION_CODE:-} && $code != "$DISTRIBUTION_VERSION_CODE" ]]; then
+    fail 2 "build: the bundle versionCode is $code, expected $DISTRIBUTION_VERSION_CODE"
+  fi
 }
 
 publish() {
-  local bundle=$1 identifier name code flutter output mapping candidate result copy
-  identifier=$(manifest "$bundle" /manifest/@package)
-  name=$(manifest "$bundle" /manifest/@android:versionName)
-  code=$(manifest "$bundle" /manifest/@android:versionCode)
-  flutter=$(flutter_version)
-
+  local bundle=$1 output mapping result copy candidate identifier name code flutter=''
   mkdir -p "$DISTRIBUTION_OUTPUT_DIR" "$workspace/output"
 
   temporary_file output "$DISTRIBUTION_OUTPUT_DIR" app-unsigned.aab
   cp -- "$bundle" "$output"
-  commit "$output" "$DISTRIBUTION_OUTPUT_DIR/app-unsigned.aab"
+  assert_unsigned "$output"
+  identifier=$(manifest "$output" /manifest/@package)
+  name=$(manifest "$output" /manifest/@android:versionName)
+  code=$(manifest "$output" /manifest/@android:versionCode)
+  assert_identity "$identifier" "$code"
 
   temporary_file mapping "$DISTRIBUTION_OUTPUT_DIR" mapping.txt
   candidate=$(dirname "$(dirname "$(dirname "$bundle")")")/mapping/$(basename "$(dirname "$bundle")")/mapping.txt
   if [[ -f $candidate ]]; then
     cp -- "$candidate" "$mapping"
   fi
-  commit "$mapping" "$DISTRIBUTION_OUTPUT_DIR/mapping.txt"
 
+  if [[ ${DISTRIBUTION_FRAMEWORK:-} == flutter ]]; then
+    flutter=$flutter_root/bin/cache/flutter.version.json
+  fi
   temporary_file result "$workspace/output" result.json
-  python3 -I - "$result" "$identifier" "$name" "$code" "$DISTRIBUTION_IMAGE" "$FASTLANE_VERSION" "$JAVA_HOME/release" "$gradle_version" "$flutter" <<'PYTHON'
+  python3 -I - "$result" "$identifier" "$name" "$code" "$DISTRIBUTION_IMAGE" "$fastlane_version" "$JAVA_HOME/release" "$gradle_version" "$flutter" <<'PYTHON'
 import json
 import sys
 
 path, identifier, name, code, image, fastlane, release, gradle, flutter = sys.argv[1:]
+
+if not code.isdigit():
+    print(f'[distribution] build: versionCode {code!r} is not an integer', file=sys.stderr)
+    sys.exit(2)
 
 properties = {}
 with open(release, encoding='utf-8') as handle:
@@ -327,8 +465,13 @@ with open(release, encoding='utf-8') as handle:
         properties[key] = value.strip('"')
 java = properties.get('JAVA_RUNTIME_VERSION') or properties.get('JAVA_VERSION')
 
-if not code.isdigit():
-    sys.exit(f'[distribution] versionCode {code!r} is not an integer')
+framework = None
+if flutter:
+    try:
+        with open(flutter, encoding='utf-8') as handle:
+            framework = json.load(handle).get('frameworkVersion')
+    except (OSError, ValueError):
+        framework = None
 
 result = {
     'artifact': 'app-unsigned.aab',
@@ -341,7 +484,7 @@ result = {
         'fastlane': fastlane,
         'java': java,
         'gradle': gradle or None,
-        'flutter': flutter or None,
+        'flutter': framework or None,
     },
 }
 with open(path, 'w', encoding='utf-8') as handle:
@@ -349,18 +492,20 @@ with open(path, 'w', encoding='utf-8') as handle:
     handle.write('\n')
 print(json.dumps(result))
 PYTHON
-  commit "$result" "$workspace/output/result.json"
 
+  commit "$mapping" "$DISTRIBUTION_OUTPUT_DIR/mapping.txt"
   if [[ $(realpath -- "$DISTRIBUTION_OUTPUT_DIR") != "$(realpath -- "$workspace/output")" ]]; then
     temporary_file copy "$DISTRIBUTION_OUTPUT_DIR" result.json
-    cp -- "$workspace/output/result.json" "$copy"
+    cp -- "$result" "$copy"
     commit "$copy" "$DISTRIBUTION_OUTPUT_DIR/result.json"
   fi
+  commit "$result" "$workspace/output/result.json"
+  commit "$output" "$DISTRIBUTION_OUTPUT_DIR/app-unsigned.aab"
 }
 
 stop_daemons() {
   if [[ -n $gradle_project && -x $gradle_project/gradlew ]]; then
-    (cd "$gradle_project" && ./gradlew --stop --quiet) > /dev/null 2>&1 || true
+    (cd "$gradle_project" && timeout -k 5 "$stop_seconds" ./gradlew --stop --quiet) > /dev/null 2>&1 || true
   fi
 }
 
@@ -394,16 +539,31 @@ save_cache() {
 main() {
   local root bundle
   trap cleanup EXIT
-  require DISTRIBUTION_BUILD_COMMAND DISTRIBUTION_OUTPUT_PATH DISTRIBUTION_IMAGE FASTLANE_VERSION
+  require DISTRIBUTION_BUILD_COMMAND DISTRIBUTION_OUTPUT_PATH DISTRIBUTION_IMAGE
+  sweep_temporary
   restore_cache
   root=$(resolve_root)
-  install_dependencies "$root"
+  install_dependencies "$root" || failed $? install
   configure_gradle "$root"
   run_lane
   bundle=$(locate_bundle "$root")
-  assert_unsigned "$bundle"
   publish "$bundle"
   save_cache || info 'cache: save failed, the build is unaffected'
 }
 
-main "$@" 2>&1 | fold -b -w "$width"
+terminate() {
+  trap '' TERM INT
+  printf '[distribution] build: terminated by signal\n' >&2
+  if [[ -n $job ]]; then
+    kill -TERM -- "-$job" 2> /dev/null || true
+  fi
+  exit "$1"
+}
+
+job=''
+set -m
+trap 'terminate 143' TERM
+trap 'terminate 130' INT
+(main "$@" 2>&1 | stdbuf -oL fold -b -w "$width") < /dev/null &
+job=$!
+wait "$job"

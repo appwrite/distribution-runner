@@ -6,8 +6,10 @@ opt_out_usage
 
 platform :android do
   lane :build do
-    root = File.expand_path(ENV.fetch('DISTRIBUTION_ROOT_DIRECTORY'), ENV.fetch('DISTRIBUTION_SOURCE'))
-    UI.user_error!('root directory escapes the checkout') unless root.start_with?(File.realpath(ENV.fetch('DISTRIBUTION_SOURCE')))
+    source = File.realpath(ENV.fetch('DISTRIBUTION_SOURCE'))
+    root = File.expand_path(ENV.fetch('DISTRIBUTION_ROOT_DIRECTORY'), source)
+    root = File.join(root, 'android') if ENV['DISTRIBUTION_FRAMEWORK'] == 'react-native'
+    UI.user_error!('root directory escapes the checkout') unless root == source || root.start_with?(source + File::SEPARATOR)
     Dir.chdir(root) do
       sh(ENV.fetch('DISTRIBUTION_BUILD_COMMAND'))
     end
