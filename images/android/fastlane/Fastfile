@@ -1,0 +1,15 @@
+# Owned by the image. Run with the working directory set to the directory that holds
+# this fastlane/ folder, never inside the checkout: fastlane only looks for
+# ./fastlane/Fastfile, ./.fastlane/Fastfile and ./Fastfile relative to the working directory.
+skip_docs
+opt_out_usage
+
+platform :android do
+  lane :build do
+    root = File.expand_path(ENV.fetch('DISTRIBUTION_ROOT_DIRECTORY'), ENV.fetch('DISTRIBUTION_SOURCE'))
+    UI.user_error!('root directory escapes the checkout') unless root.start_with?(File.realpath(ENV.fetch('DISTRIBUTION_SOURCE')))
+    Dir.chdir(root) do
+      sh(ENV.fetch('DISTRIBUTION_BUILD_COMMAND'))
+    end
+  end
+end

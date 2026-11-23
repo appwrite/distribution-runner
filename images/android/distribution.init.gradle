@@ -1,0 +1,45 @@
+// Placed in $GRADLE_USER_HOME/init.d/ by build.sh. Never edits the checkout.
+// Forces every non-debuggable (release-like) variant to be UNSIGNED and injects the
+// version from the environment. Written in Groovy so it applies to Groovy DSL and
+// Kotlin DSL projects alike; AGP types are reached dynamically because the Android
+// Gradle plugin is not on the init script classpath.
+def versionCode = System.getenv('DISTRIBUTION_VERSION_CODE')
+def versionName = System.getenv('DISTRIBUTION_VERSION_NAME')
+
+// `target.signingConfig = null` is an ambiguous overload on AGP 8 defaultConfig and
+// product flavors (three setSigningConfig overloads), so the setter is called reflectively.
+def unsign = { target ->
+    def setter = target.getClass().methods.find { it.name == 'setSigningConfig' && it.parameterCount == 1 }
+    setter.invoke(target, [null] as Object[])
+}
+
+gradle.allprojects { project ->
+    project.pluginManager.withPlugin('com.android.application') {
+        def components = project.extensions.getByName('androidComponents')
+
+        components.finalizeDsl { android ->
+            def release = android.buildTypes.findAll { !it.debuggable }
+            if (!release.isEmpty()) {
+                release.each { unsign(it) }
+                unsign(android.defaultConfig)
+                android.productFlavors.each { unsign(it) }
+            }
+            project.logger.lifecycle("[distribution] ${project.path}: signingConfig removed from build types ${release*.name}")
+        }
+
+        components.onVariants(components.selector().all()) { variant ->
+            if (variant.debuggable) {
+                return
+            }
+            variant.outputs.each { output ->
+                if (versionCode) {
+                    output.versionCode.set(versionCode as Integer)
+                }
+                if (versionName) {
+                    output.versionName.set(versionName)
+                }
+            }
+            project.logger.lifecycle("[distribution] ${project.path}:${variant.name}: versionCode=${versionCode ?: 'unchanged'} versionName=${versionName ?: 'unchanged'}")
+        }
+    }
+}
