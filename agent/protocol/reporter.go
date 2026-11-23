@@ -27,7 +27,8 @@ const (
 type Reporter struct {
 	session *Session
 	wake    chan struct{}
-	stop    context.CancelFunc
+	stop    chan struct{}
+	abort   context.CancelFunc
 	done    chan struct{}
 	limit   int64
 
@@ -46,11 +47,12 @@ type Reporter struct {
 }
 
 func NewReporter(session *Session, interval time.Duration) *Reporter {
-	ctx, stop := context.WithCancel(context.Background())
+	ctx, abort := context.WithCancel(context.Background())
 	reporter := &Reporter{
 		session: session,
 		wake:    make(chan struct{}, 1),
-		stop:    stop,
+		stop:    make(chan struct{}),
+		abort:   abort,
 		done:    make(chan struct{}),
 		limit:   LogLimit,
 	}
@@ -109,7 +111,7 @@ func (r *Reporter) Flush(ctx context.Context) error {
 }
 
 // Close sends the remaining partial lines and events, stops the background sender and returns every error
-// that cost events.
+// that cost events. A send in flight is allowed to finish, so its batch is not sent twice, unless ctx ends first.
 func (r *Reporter) Close(ctx context.Context) error {
 	r.mutex.Lock()
 	r.closed = true
@@ -119,8 +121,14 @@ func (r *Reporter) Close(ctx context.Context) error {
 	for _, writer := range writers {
 		writer.close()
 	}
-	r.stop()
-	<-r.done
+	close(r.stop)
+	select {
+	case <-r.done:
+	case <-ctx.Done():
+		r.abort()
+		<-r.done
+	}
+	defer r.abort()
 	err := r.flush(ctx)
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
@@ -133,7 +141,7 @@ func (r *Reporter) run(ctx context.Context, interval time.Duration) {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-r.stop:
 			return
 		case <-ticker.C:
 		case <-r.wake:

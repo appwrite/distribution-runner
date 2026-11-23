@@ -422,3 +422,32 @@ func TestReporterCloseReleasesABlockedWriter(t *testing.T) {
 		t.Fatal("Close left the writer blocked")
 	}
 }
+
+func TestReporterCloseLetsASendInFlightFinish(t *testing.T) {
+	server := newFake(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	server.handle("POST "+leasePath+"/events", func(writer http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	})
+	reporter := NewReporter(server.session(t), 5*time.Millisecond)
+	reporter.Log(StreamStdout, "once")
+	<-entered
+
+	closed := make(chan error, 1)
+	go func() { closed <- reporter.Close(context.Background()) }()
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	if err := <-closed; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if requests := server.matching(http.MethodPost, leasePath+"/events"); len(requests) != 1 {
+		t.Fatalf("requests = %d, want the batch in flight sent once", len(requests))
+	}
+}
