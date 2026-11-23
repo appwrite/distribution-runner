@@ -18,7 +18,7 @@ The image is `linux/amd64` only and builds only in CI (`make android` refuses un
 | Ruby | 3.3 (Debian `ruby`) | apt |
 | fastlane | `2.242.0` | `Gemfile.lock`, installed with `BUNDLE_FROZEN` |
 | bundletool | `1.18.3` | GitHub release asset digest |
-| Other | `git`, `python3`, `squashfs-tools`, `unzip`, `zip`, `xz-utils`, `file` | apt |
+| Other | `git`, `python3`, `squashfs-tools`, `unzip`, `zip`, `xz-utils`, `file`, `libatomic1` (the official Node.js binary links `libatomic.so.1`) | apt |
 
 Why these SDK packages: React Native 0.88.1 asks for build-tools 37.0.0, compile SDK 37 and NDK 27.1.12297006. Flutter 3.41.2 asks for compile SDK 36 and NDK 28.2.13676358, and its template's AGP 8.11 defaults to build-tools 35.0.0. Anything else a project asks for (another NDK, CMake) is downloaded by AGP at build time, which works because the SDK licences are accepted in the image.
 

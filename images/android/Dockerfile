@@ -36,6 +36,7 @@ RUN apt-get update \
         curl \
         file \
         git \
+        libatomic1 \
         python3 \
         ruby \
         squashfs-tools \
