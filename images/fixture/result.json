@@ -1,0 +1,1 @@
+{"artifact": "app-unsigned.aab", "type": "aab", "identifier": "io.appwrite.distribution.fixture", "versionName": "1.0.0", "versionCode": 1, "toolchain": {"image": "@IMAGE@", "fastlane": null, "java": null, "gradle": null, "flutter": null}}
