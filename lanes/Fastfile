@@ -1,0 +1,118 @@
+# Installed as /usr/local/distribution/fastlane/Fastfile and run with that directory as the working directory.
+# fastlane reads ./fastlane/{Fastfile,Appfile,.env} from its working directory, so nothing here may chdir into the
+# checkout around an action, and build_app only ever receives absolute paths.
+require 'json'
+require 'shellwords'
+
+skip_docs
+opt_out_usage
+
+GYMFILES = ['fastlane/Gymfile', '.fastlane/Gymfile', 'Gymfile'].freeze
+SEARCHES = [['.', '*.xcworkspace', :workspace], ['ios', '*.xcworkspace', :workspace], ['.', '*.xcodeproj', :project], ['ios', '*.xcodeproj', :project]].freeze
+
+def inside(source, base, relative)
+  UI.user_error!("#{relative.inspect} must be a relative path") unless relative.is_a?(String) && !relative.empty? && !relative.start_with?('/')
+  begin
+    path = File.realpath(File.expand_path(relative, base))
+  rescue SystemCallError
+    UI.user_error!("#{relative} was not found in the checkout")
+  end
+  UI.user_error!("#{relative} escapes the checkout") unless path == source || path.start_with?(source + File::SEPARATOR)
+  path
+end
+
+def configuration
+  value = JSON.parse(ENV.fetch('DISTRIBUTION_CONFIGURATION', '').then { |text| text.empty? ? '{}' : text })
+  UI.user_error!('DISTRIBUTION_CONFIGURATION must be a JSON object') unless value.is_a?(Hash)
+  value
+rescue JSON::ParserError
+  UI.user_error!('DISTRIBUTION_CONFIGURATION is not valid JSON')
+end
+
+def container(source, root, settings)
+  [:workspace, :project].each do |kind|
+    return { kind => inside(source, root, settings[kind.to_s]) } if settings.key?(kind.to_s)
+  end
+  SEARCHES.each do |directory, pattern, kind|
+    base = File.join(root, directory)
+    next unless File.directory?(base)
+
+    matches = Dir.glob(pattern, base: base).sort
+    next if matches.empty?
+
+    UI.user_error!("found #{matches.join(', ')} in #{directory}; set workspace or project in the target configuration") if matches.length > 1
+    return { kind => inside(source, base, matches.first) }
+  end
+  UI.user_error!('no Xcode workspace or project found; set workspace or project in the target configuration')
+end
+
+def setting(settings, key)
+  value = settings[key]
+  return nil if value.nil?
+
+  UI.user_error!("#{key} in the target configuration must be a non-empty string") unless value.is_a?(String) && !value.empty?
+  value
+end
+
+def build_settings
+  name = ENV.fetch('DISTRIBUTION_VERSION_NAME', '')
+  code = ENV.fetch('DISTRIBUTION_VERSION_CODE', '')
+  settings = {
+    'CODE_SIGN_STYLE' => 'Manual',
+    'DEVELOPMENT_TEAM' => ENV.fetch('DISTRIBUTION_TEAM_ID'),
+    'CODE_SIGN_IDENTITY' => ENV.fetch('DISTRIBUTION_SIGNING_IDENTITY')
+  }
+  settings['MARKETING_VERSION'] = name unless name.empty?
+  settings['CURRENT_PROJECT_VERSION'] = code unless code.empty?
+  if ENV['DISTRIBUTION_FRAMEWORK'] == 'flutter'
+    settings['FLUTTER_BUILD_NAME'] = name unless name.empty?
+    settings['FLUTTER_BUILD_NUMBER'] = code unless code.empty?
+  end
+  settings.map { |key, value| "#{key}=#{value}".shellescape }.join(' ')
+end
+
+def ignore_gymfiles(directory)
+  GYMFILES.each do |name|
+    path = File.join(directory, name)
+    next unless File.file?(path) || File.symlink?(path)
+
+    UI.important("ignoring #{path}: the build lane is fixed")
+    File.delete(path)
+  end
+end
+
+platform :ios do
+  lane :build do
+    source = File.realpath(ENV.fetch('DISTRIBUTION_SOURCE'))
+    root = inside(source, source, ENV.fetch('DISTRIBUTION_ROOT_DIRECTORY', '').then { |value| value.empty? ? '.' : value })
+    archive = ENV.fetch('DISTRIBUTION_ARCHIVE_PATH')
+    UI.user_error!('DISTRIBUTION_ARCHIVE_PATH must be absolute') unless archive.start_with?('/')
+    output = File.dirname(archive)
+
+    command = ENV.fetch('DISTRIBUTION_BUILD_COMMAND', '')
+    unless command.empty?
+      run = -> { sh(command: command, chdir: root) }
+      defined?(Bundler) ? Bundler.with_unbundled_env(&run) : run.call
+    end
+
+    settings = configuration
+    project = container(source, root, settings)
+    scheme = setting(settings, 'scheme') || ENV.fetch('DISTRIBUTION_SCHEME', '').then { |value| value.empty? ? nil : value }
+    scheme ||= 'Runner' if ENV['DISTRIBUTION_FRAMEWORK'] == 'flutter'
+    ignore_gymfiles(File.dirname(project.values.first))
+
+    options = project.merge(
+      configuration: setting(settings, 'configuration') || 'Release',
+      destination: 'generic/platform=iOS',
+      archive_path: archive,
+      derived_data_path: File.join(output, 'DerivedData'),
+      buildlog_path: File.join(output, 'logs'),
+      output_directory: output,
+      skip_package_ipa: true,
+      skip_profile_detection: true,
+      xcargs: build_settings
+    )
+    options[:scheme] = scheme if scheme
+    build_app(**options)
+  end
+end
