@@ -19,7 +19,7 @@ ANDROID_IMAGE := $(REPOSITORY)-android:$(TAG)
 
 export TOOLS_IMAGE TOOLS_TEST_IMAGE FIXTURE_IMAGE ANDROID_IMAGE
 
-SCRIPTS = $(wildcard $(shell git ls-files --cached --others --exclude-standard -- '*.sh'))
+SCRIPTS = $(wildcard $(shell git ls-files --cached --others --exclude-standard -- '*.sh') images/tools/bundletool)
 BATS = $(wildcard tests/*.bats tests/helpers.bash)
 DOCKERFILES = $(wildcard images/*/Dockerfile tests/Dockerfile)
 
