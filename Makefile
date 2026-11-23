@@ -1,10 +1,14 @@
 TAG ?= dev
+VERSION ?= $(TAG)
+PLATFORM ?=
 REPOSITORY ?= appwrite/distribution
 AGENT_PLATFORMS ?= darwin/arm64 darwin/amd64
 GOTESTFLAGS ?=
 TRIVY_CACHE_DIR ?= $(CURDIR)/.trivy/cache
 TRIVY_TMP ?= $(CURDIR)/.trivy/tmp
 
+SHELLCHECK_IMAGE := koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
+PYTHON_IMAGE := python:3.13-slim-trixie@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 HADOLINT_IMAGE := hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
 ACTIONLINT_IMAGE := rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
 BATS_IMAGE := bats/bats:1.14.0@sha256:5322b877351fda0cc435de8c6116de7d0a2ec79d7c680132a0ef329a633bc66f
@@ -17,10 +21,13 @@ TOOLS_BATS_IMAGE := $(REPOSITORY)-tools:bats
 FIXTURE_IMAGE := $(REPOSITORY)-fixture:$(TAG)
 ANDROID_IMAGE := $(REPOSITORY)-android:$(TAG)
 
+PLATFORM_FLAG = $(if $(PLATFORM),--platform $(PLATFORM))
+
 export TOOLS_IMAGE TOOLS_TEST_IMAGE FIXTURE_IMAGE ANDROID_IMAGE
 
-SCRIPTS = $(wildcard $(shell git ls-files --cached --others --exclude-standard -- '*.sh'))
+SCRIPTS = $(wildcard $(shell git ls-files --cached --others --exclude-standard -- '*.sh') images/tools/bundletool)
 BATS = $(wildcard tests/*.bats tests/helpers.bash)
+PYTHON = $(wildcard $(shell git ls-files --cached --others --exclude-standard -- '*.py'))
 DOCKERFILES = $(wildcard images/*/Dockerfile tests/Dockerfile)
 
 TRIVY = docker run --rm \
@@ -32,13 +39,13 @@ TRIVY = docker run --rm \
 
 .DEFAULT_GOAL := help
 
-.PHONY: help lint shellcheck hadolint actionlint tools tools-test fixture fixture-generate android agent \
+.PHONY: help lint shellcheck pycompile hadolint actionlint tools tools-test fixture fixture-generate android agent \
 	test-tools test-fixture test-android test-agent scan-agent check
 
 help:
-	@echo 'Usage: make <target> [TAG=dev]'
+	@echo 'Usage: make <target> [TAG=dev] [VERSION=<TAG>] [PLATFORM=linux/arm64]'
 	@echo ''
-	@echo '  lint              shellcheck, hadolint and actionlint'
+	@echo '  lint              shellcheck, py_compile, hadolint and actionlint'
 	@echo '  check             lint, build tools and fixture, run tools, fixture and agent tests'
 	@echo '  tools             build $(TOOLS_IMAGE)'
 	@echo '  tools-test        build $(TOOLS_TEST_IMAGE) (test CA trusted, never published)'
@@ -53,14 +60,23 @@ help:
 	@echo '  scan-<image>      Trivy gate and report for tools, fixture or android'
 	@echo '  scan-agent        Trivy gate for the agent binaries'
 
-lint: shellcheck hadolint actionlint
+lint: shellcheck pycompile hadolint actionlint
+
+SHELLCHECK = docker run --rm -v "$(CURDIR):/repo:ro" -w /repo $(SHELLCHECK_IMAGE)
 
 shellcheck:
 ifeq ($(strip $(SCRIPTS) $(BATS)),)
 	@echo 'skip: no shell scripts'
 else
-	$(if $(SCRIPTS),shellcheck $(SCRIPTS))
-	$(if $(BATS),shellcheck -s bash $(BATS))
+	$(if $(SCRIPTS),$(SHELLCHECK) $(SCRIPTS))
+	$(if $(BATS),$(SHELLCHECK) -s bash $(BATS))
+endif
+
+pycompile:
+ifeq ($(strip $(PYTHON)),)
+	@echo 'skip: no Python files'
+else
+	docker run --rm -v "$(CURDIR):/repo:ro" -w /repo -e PYTHONPYCACHEPREFIX=/tmp/pycache $(PYTHON_IMAGE) python3 -m py_compile $(PYTHON)
 endif
 
 hadolint:
@@ -77,7 +93,7 @@ tools:
 ifeq ($(wildcard images/tools/Dockerfile),)
 	@echo 'skip: images/tools/Dockerfile not found'
 else
-	docker build -t $(TOOLS_IMAGE) images/tools
+	docker build $(PLATFORM_FLAG) --target release -t $(TOOLS_IMAGE) images/tools
 endif
 
 tools-test:
@@ -91,7 +107,7 @@ fixture:
 ifeq ($(wildcard images/fixture/Dockerfile),)
 	@echo 'skip: images/fixture/Dockerfile not found'
 else
-	docker build --build-arg VERSION=$(TAG) -t $(FIXTURE_IMAGE) images/fixture
+	docker build $(PLATFORM_FLAG) --build-arg VERSION=$(VERSION) -t $(FIXTURE_IMAGE) images/fixture
 endif
 
 fixture-generate:
@@ -107,7 +123,7 @@ ifeq ($(wildcard images/android/Dockerfile),)
 else ifneq ($(CI),true)
 	$(error the android image builds only in CI, set CI=true to override)
 else
-	docker build --platform linux/amd64 --build-arg VERSION=$(TAG) -t $(ANDROID_IMAGE) images/android
+	docker build --platform linux/amd64 --build-arg VERSION=$(VERSION) -t $(ANDROID_IMAGE) images/android
 endif
 
 agent:

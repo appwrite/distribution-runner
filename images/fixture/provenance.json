@@ -1,0 +1,34 @@
+{
+  "bundle": {
+    "file": "app-unsigned.aab",
+    "sha256": "51627b51c597a259f79f1276f549aa81bbd64f1bd4b0058caec48b28bf775be8",
+    "identifier": "io.appwrite.distribution.fixture",
+    "versionName": "1.0.0",
+    "versionCode": 1,
+    "minSdk": 24,
+    "targetSdk": 36
+  },
+  "generator": {
+    "script": "images/fixture/generate.sh",
+    "platform": "linux/amd64",
+    "java": "21.0.13.1+2-1-deb13u1-Debian"
+  },
+  "inputs": {
+    "aapt2": {
+      "version": "9.5.2-16666295",
+      "url": "https://dl.google.com/dl/android/maven2/com/android/tools/build/aapt2/9.5.2-16666295/aapt2-9.5.2-16666295-linux.jar",
+      "sha256": "fa1014cb1431622d292ef55ba870e75882ea19987bec541698b912f446a2d08f"
+    },
+    "platform": {
+      "package": "platforms;android-36",
+      "url": "https://dl.google.com/android/repository/platform-36_r02.zip",
+      "sha1": "2c1a80dd4d9f7d0e6dd336ec603d9b5c55a6f576",
+      "sha256": "37607369a28c5b640b3a7998868d45898ebcb777565a0e85f9acf36f29631d2e"
+    },
+    "bundletool": {
+      "version": "1.18.3",
+      "url": "https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar",
+      "sha256": "a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29"
+    }
+  }
+}
