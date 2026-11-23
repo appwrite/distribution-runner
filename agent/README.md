@@ -27,13 +27,13 @@ Every flag has an environment variable; the flag wins.
 | `--secret-file` | `DISTRIBUTION_AGENT_SECRET_FILE` | | File holding the enrolment secret. `DISTRIBUTION_AGENT_SECRET` works too. Read only when the state file has no credentials; never a flag value, so it stays out of `ps` |
 | `--state` | `DISTRIBUTION_AGENT_STATE` | `~/Library/Application Support/appwrite-distribution/agent.json` | Runner id and token, written atomically with mode `0600`; a state file other users can read is refused |
 | `--name` | `DISTRIBUTION_AGENT_NAME` | host name | |
-| `--labels` | `DISTRIBUTION_AGENT_LABELS` | | Comma-separated, such as `xcode-27.2` |
+| `--labels` | `DISTRIBUTION_AGENT_LABELS` | | Comma-separated, such as `xcode-27.2`; for `lume`, the golden image's `vm/labels` joined with commas |
 | `--capacity` | `DISTRIBUTION_AGENT_CAPACITY` | `1` | Concurrent leases, at most 2 (the macOS licence ceiling) |
 | `--vm` | `DISTRIBUTION_AGENT_VM` | `lume` | `lume`, or `fake` to run leases without a Mac (below) |
-| `--golden` | `DISTRIBUTION_AGENT_GOLDEN` | | Golden lume VM; required for `lume` and reported as the build image |
+| `--golden` | `DISTRIBUTION_AGENT_GOLDEN` | | Golden lume VM, `IMAGE` in `vm/versions.env` ([vm/README.md](../vm/README.md)); required for `lume` and reported as the build image |
 | `--ssh-key` | `DISTRIBUTION_AGENT_SSH_KEY` | | Private key the guest account authorises; required for `lume` |
-| `--known-hosts` | `DISTRIBUTION_AGENT_KNOWN_HOSTS` | | Pins the golden image's host key |
-| `--ssh-user` | `DISTRIBUTION_AGENT_SSH_USER` | `lume` | |
+| `--known-hosts` | `DISTRIBUTION_AGENT_KNOWN_HOSTS` | | Pins the golden image's host key, recorded with the golden image's name as the host (`<golden> ssh-ed25519 AAAA…`) |
+| `--ssh-user` | `DISTRIBUTION_AGENT_SSH_USER` | `lume` | The account lume's unattended setup creates, which `vm/provision.sh` runs as |
 | `--lume` | `DISTRIBUTION_AGENT_LUME` | `lume` on `PATH` | |
 | `--directory` | `DISTRIBUTION_AGENT_DIRECTORY` | `$TMPDIR/distribution-agent` | Host scratch space, one `0700` directory per lease, removed when it ends |
 | `--allow-http` | `DISTRIBUTION_AGENT_ALLOW_HTTP` | `false` | Local development only |
