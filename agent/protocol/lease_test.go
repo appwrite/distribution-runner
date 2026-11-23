@@ -22,7 +22,7 @@ func TestSessionSendsLeaseTokenAndQueryHeaders(t *testing.T) {
 		writer.WriteHeader(http.StatusNoContent)
 	})
 	server.handle("POST "+leasePath+"/artifacts", func(writer http.ResponseWriter, request *http.Request) {
-		respond(t, writer, http.StatusAccepted, map[string]any{"$id": request.Header.Get("X-Appwrite-Id"), "chunksTotal": 1, "chunksUploaded": 1})
+		respond(t, writer, http.StatusAccepted, map[string]any{"$id": "artifact1", "chunksTotal": 1, "chunksUploaded": 1})
 	})
 	path := filepath.Join(t.TempDir(), "app.ipa")
 	if err := os.WriteFile(path, []byte("ipa"), 0o600); err != nil {

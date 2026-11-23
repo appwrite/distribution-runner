@@ -98,7 +98,9 @@ A failure never uploads and never sends `complete`; like success, it sends the e
 
 Build output is capped at 50,000,000 bytes per lease, the server's default `_APP_DISTRIBUTION_LOGS_LIMIT`, with each line charged 16 bytes on top of its own so a flood of empty lines is capped too: past it one `stderr` truncation line is sent and the rest dropped. While 16 MiB of output is undelivered, queued or in a send that has not succeeded yet (a slow or failing server), the agent stops reading the guest's output, which pushes back through ssh to the build.
 
-Chunks are uploaded under an id the agent mints (26 lowercase base32 characters, a valid UID) and sends as `x-appwrite-id` on every chunk, the first included, so a first chunk resent after a lost response names the same upload. The upload fails unless a response reports `chunksUploaded` equal to `chunksTotal`.
+Chunks follow RFC §14 and Sites deployments: the first chunk goes alone and without `x-appwrite-id`, the server names the upload in that response's `$id`, and every later chunk sends that id as `x-appwrite-id`, up to 4 at once. An id that is not a valid Appwrite id (1 to 36 letters, digits, `.`, `_` or `-`, not starting with punctuation) fails the upload. The upload fails unless a response for that id reports `chunksUploaded` equal to `chunksTotal`.
+
+Assumption for the server team: a first chunk whose response is lost (a timeout or a dropped connection after the server stored it) is retried without an id, so it starts a second upload and the first is abandoned with one chunk stored. The agent relies on the server deleting such incomplete uploads after `_APP_STORAGE_UPLOAD_RETENTION`, as it does for storage and deployment uploads, and on an abandoned upload never counting as the lease's output artifact.
 
 The `result` content:
 
@@ -132,6 +134,6 @@ DISTRIBUTION_AGENT_SECRET=... go run . --vm fake --allow-http true \
 ## Unproven
 
 - The lume adapter (spike S7), including per-machine host keys; see [vm/README.md](vm/README.md).
-- Event data shapes, the upload field name, the agent-minted upload id on the first chunk and the `result` content are pending the server's lease events and artifacts actions (m4b).
+- Event data shapes, the upload field name, the server-named upload id and the clean-up of abandoned uploads (above), and the `result` content are pending the server's lease events and artifacts actions (m4b).
 - A route to requeue a lease that failed on the host instead of failing the build (m4b).
 - No lease has run end to end on a real Mac.

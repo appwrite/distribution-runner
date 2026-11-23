@@ -136,8 +136,12 @@ func (s *server) serveUpload(writer http.ResponseWriter, request *http.Request) 
 	}
 	uploaded := (end + protocol.ChunkSize) / protocol.ChunkSize
 	s.mutex.Unlock()
+	id := request.Header.Get("X-Appwrite-Id")
+	if id == "" {
+		id = "artifact1"
+	}
 	respond(writer, http.StatusCreated, map[string]any{
-		"$id":            request.Header.Get("X-Appwrite-Id"),
+		"$id":            id,
 		"chunksUploaded": uploaded,
 		"chunksTotal":    (total + protocol.ChunkSize - 1) / protocol.ChunkSize,
 	})
@@ -509,8 +513,8 @@ func TestRunSuccess(t *testing.T) {
 	if got := uploads[0].Header.Get("Content-Range"); got != fmt.Sprintf("bytes 0-%d/%d", protocol.ChunkSize-1, total) {
 		t.Errorf("first content-range = %q", got)
 	}
-	if id := uploads[0].Header.Get("X-Appwrite-Id"); id == "" || uploads[1].Header.Get("X-Appwrite-Id") != id {
-		t.Errorf("x-appwrite-id = %q then %q, want one minted id on every chunk", id, uploads[1].Header.Get("X-Appwrite-Id"))
+	if _, named := uploads[0].Header["X-Appwrite-Id"]; named || uploads[1].Header.Get("X-Appwrite-Id") != "artifact1" {
+		t.Errorf("x-appwrite-id = %q then %q, want none on the first chunk, then the id its response named", uploads[0].Header.Get("X-Appwrite-Id"), uploads[1].Header.Get("X-Appwrite-Id"))
 	}
 	for _, request := range h.server.recorded() {
 		if strings.HasPrefix(request.URL, "/v1/") && request.Header.Get("Authorization") != "Bearer "+testLeaseToken {

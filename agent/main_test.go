@@ -220,8 +220,8 @@ func newControlPlane(t *testing.T) *controlPlane {
 		plane.mutex.Unlock()
 		writer.WriteHeader(http.StatusNoContent)
 	})
-	mux.HandleFunc("POST "+leasePath+"/artifacts", func(writer http.ResponseWriter, request *http.Request) {
-		reply(writer, http.StatusCreated, map[string]any{"$id": request.Header.Get("X-Appwrite-Id"), "chunksUploaded": 1, "chunksTotal": 1})
+	mux.HandleFunc("POST "+leasePath+"/artifacts", func(writer http.ResponseWriter, _ *http.Request) {
+		reply(writer, http.StatusCreated, map[string]any{"$id": "artifact1", "chunksUploaded": 1, "chunksTotal": 1})
 	})
 	mux.HandleFunc("GET "+leasePath+"/source", func(writer http.ResponseWriter, _ *http.Request) {
 		reply(writer, http.StatusOK, protocol.Source{URL: plane.server.URL + "/tarball", Format: "tarball"})

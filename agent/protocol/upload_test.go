@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -37,6 +39,8 @@ type uploadServer struct {
 	chunks   []chunk
 	attempts map[int64]int32
 	stored   map[int64]bool
+	// minted holds every upload id the server named, in order; a first chunk without an id starts a new upload.
+	minted []string
 
 	inFlight atomic.Int32
 	peak     atomic.Int32
@@ -63,10 +67,17 @@ func (u *uploadServer) handler(writer http.ResponseWriter, request *http.Request
 	data := u.part(request)
 
 	_, named := request.Header["X-Appwrite-Id"]
+	id := request.Header.Get("X-Appwrite-Id")
 	u.mutex.Lock()
 	u.attempts[start]++
 	attempt := u.attempts[start]
-	u.chunks = append(u.chunks, chunk{start: start, end: end, total: total, id: request.Header.Get("X-Appwrite-Id"), named: named, length: int64(len(data))})
+	u.chunks = append(u.chunks, chunk{start: start, end: end, total: total, id: id, named: named, length: int64(len(data))})
+	if !named {
+		id = fmt.Sprintf("upload%d", len(u.minted)+1)
+		u.minted = append(u.minted, id)
+	} else if !slices.Contains(u.minted, id) {
+		u.t.Errorf("chunk at %d named %q, an upload the server never created", start, id)
+	}
 	u.mutex.Unlock()
 
 	if !bytes.Equal(data, u.content[start:min(end+1, int64(len(u.content)))]) {
@@ -86,13 +97,14 @@ func (u *uploadServer) handler(writer http.ResponseWriter, request *http.Request
 	uploaded := len(u.stored)
 	u.mutex.Unlock()
 	chunks := (total + ChunkSize - 1) / ChunkSize
-	respond(u.t, writer, http.StatusAccepted, map[string]any{"$id": request.Header.Get("X-Appwrite-Id"), "chunksTotal": chunks, "chunksUploaded": uploaded})
+	respond(u.t, writer, http.StatusAccepted, map[string]any{"$id": id, "chunksTotal": chunks, "chunksUploaded": uploaded})
 }
 
 type uploadState struct {
 	chunks   []chunk
 	attempts map[int64]int32
 	stored   int
+	minted   []string
 }
 
 func (u *uploadServer) state() uploadState {
@@ -102,7 +114,7 @@ func (u *uploadServer) state() uploadState {
 	for start, count := range u.attempts {
 		attempts[start] = count
 	}
-	return uploadState{chunks: append([]chunk(nil), u.chunks...), attempts: attempts, stored: len(u.stored)}
+	return uploadState{chunks: append([]chunk(nil), u.chunks...), attempts: attempts, stored: len(u.stored), minted: append([]string(nil), u.minted...)}
 }
 
 func (u *uploadServer) part(request *http.Request) []byte {
@@ -161,11 +173,15 @@ func TestUploadChunks(t *testing.T) {
 		t.Fatalf("chunks = %d, want 7", len(state.chunks))
 	}
 	first := state.chunks[0]
-	if first.start != 0 || !first.named || len(first.id) != 26 {
-		t.Errorf("first request = %+v, want the chunk at 0 named with a minted id", first)
+	if first.start != 0 || first.named {
+		t.Errorf("first request = %+v, want the chunk at 0 without an id", first)
 	}
-	if result["chunksUploaded"] != float64(7) || result["chunksTotal"] != float64(7) || result["$id"] != first.id {
-		t.Errorf("result = %v, want the response that counts all 7 chunks", result)
+	if len(state.minted) != 1 {
+		t.Fatalf("uploads created = %v, want one", state.minted)
+	}
+	id := state.minted[0]
+	if result["chunksUploaded"] != float64(7) || result["chunksTotal"] != float64(7) || result["$id"] != id {
+		t.Errorf("result = %v, want the response that counts all 7 chunks of %s", result, id)
 	}
 	seen := map[int64]bool{}
 	for index, received := range state.chunks {
@@ -176,8 +192,8 @@ func TestUploadChunks(t *testing.T) {
 		if received.start%ChunkSize != 0 || received.length != want || received.end != received.start+want-1 || received.total != int64(size) {
 			t.Errorf("chunk %d = %+v, want an exact %d-byte chunk", index, received, want)
 		}
-		if !received.named || received.id != first.id {
-			t.Errorf("chunk %d x-appwrite-id = %q, want %q", index, received.id, first.id)
+		if index > 0 && (!received.named || received.id != id) {
+			t.Errorf("chunk %d x-appwrite-id = %q, want the first response's %q", index, received.id, id)
 		}
 		seen[received.start] = true
 	}
@@ -201,7 +217,7 @@ func TestUploadSingleChunk(t *testing.T) {
 	}
 
 	state := upload.state()
-	if len(state.chunks) != 1 || state.chunks[0] != (chunk{start: 0, end: 99, total: 100, id: state.chunks[0].id, named: true, length: 100}) {
+	if len(state.chunks) != 1 || state.chunks[0] != (chunk{start: 0, end: 99, total: 100, length: 100}) {
 		t.Errorf("chunks = %+v", state.chunks)
 	}
 	if result["chunksUploaded"] != float64(1) {
@@ -234,7 +250,7 @@ func TestUploadRetriesChunks(t *testing.T) {
 	}
 }
 
-func TestUploadResendsTheFirstChunkUnderTheSameID(t *testing.T) {
+func TestUploadRetriesTheFirstChunkWithoutAnID(t *testing.T) {
 	server, upload, path := newUpload(t, ChunkSize+10)
 	upload.fail = func(start int64, attempt int32) int {
 		if start == 0 && attempt == 1 {
@@ -243,25 +259,33 @@ func TestUploadResendsTheFirstChunkUnderTheSameID(t *testing.T) {
 		return 0
 	}
 
-	if _, err := server.session(t).Upload(context.Background(), path); err != nil {
+	result, err := server.session(t).Upload(context.Background(), path)
+	if err != nil {
 		t.Fatalf("Upload: %v", err)
 	}
 
 	state := upload.state()
-	if state.attempts[0] != 2 {
-		t.Fatalf("attempts for the first chunk = %d, want 2", state.attempts[0])
+	if state.attempts[0] != 2 || len(state.minted) != 2 {
+		t.Fatalf("first chunk attempts = %d creating uploads %v, want 2 and 2", state.attempts[0], state.minted)
 	}
+	abandoned, kept := state.minted[0], state.minted[1]
 	for index, received := range state.chunks {
-		if received.id != state.chunks[0].id || !received.named {
-			t.Errorf("chunk %d named %q, want every request named %q", index, received.id, state.chunks[0].id)
+		switch {
+		case received.start == 0 && received.named:
+			t.Errorf("chunk %d: a resent first chunk named %q, want no id", index, received.id)
+		case received.start != 0 && received.id != kept:
+			t.Errorf("chunk %d named %q, want the answered upload %q, not the abandoned %q", index, received.id, kept, abandoned)
 		}
+	}
+	if result["$id"] != kept {
+		t.Errorf("result = %v, want upload %s", result, kept)
 	}
 }
 
 func TestUploadRequiresACompletionResponse(t *testing.T) {
 	server := newFake(t)
-	server.handle("POST "+leasePath+"/artifacts", func(writer http.ResponseWriter, request *http.Request) {
-		respond(t, writer, http.StatusAccepted, map[string]any{"$id": request.Header.Get("X-Appwrite-Id"), "chunksTotal": 2, "chunksUploaded": 1})
+	server.handle("POST "+leasePath+"/artifacts", func(writer http.ResponseWriter, _ *http.Request) {
+		respond(t, writer, http.StatusAccepted, map[string]any{"$id": "upload1", "chunksTotal": 2, "chunksUploaded": 1})
 	})
 	path := filepath.Join(t.TempDir(), "app.ipa")
 	if err := os.WriteFile(path, make([]byte, ChunkSize+1), 0o600); err != nil {
@@ -273,18 +297,45 @@ func TestUploadRequiresACompletionResponse(t *testing.T) {
 	}
 }
 
-func TestUploadRefusesAnotherID(t *testing.T) {
-	server := newFake(t)
-	server.handle("POST "+leasePath+"/artifacts", func(writer http.ResponseWriter, _ *http.Request) {
-		respond(t, writer, http.StatusAccepted, map[string]any{"$id": "other", "chunksTotal": 1, "chunksUploaded": 1})
-	})
-	path := filepath.Join(t.TempDir(), "app.ipa")
-	if err := os.WriteFile(path, []byte("ipa"), 0o600); err != nil {
-		t.Fatal(err)
+func TestUploadRequiresTheUploadID(t *testing.T) {
+	tests := map[string]func(request *http.Request) map[string]any{
+		"no id": func(*http.Request) map[string]any { return map[string]any{"chunksTotal": 2, "chunksUploaded": 1} },
+		"option-like id": func(*http.Request) map[string]any {
+			return map[string]any{"$id": "-x", "chunksTotal": 2, "chunksUploaded": 1}
+		},
+		"header-breaking": func(*http.Request) map[string]any {
+			return map[string]any{"$id": "a\r\nb", "chunksTotal": 2, "chunksUploaded": 1}
+		},
+		"too long id": func(*http.Request) map[string]any {
+			return map[string]any{"$id": strings.Repeat("a", 37), "chunksTotal": 2, "chunksUploaded": 1}
+		},
+		"completion naming another upload": func(request *http.Request) map[string]any {
+			if request.Header.Get("X-Appwrite-Id") == "" {
+				return map[string]any{"$id": "upload1", "chunksTotal": 2, "chunksUploaded": 1}
+			}
+			return map[string]any{"$id": "other", "chunksTotal": 2, "chunksUploaded": 2}
+		},
 	}
+	for name, answer := range tests {
+		t.Run(name, func(t *testing.T) {
+			server := newFake(t)
+			server.handle("POST "+leasePath+"/artifacts", func(writer http.ResponseWriter, request *http.Request) {
+				respond(t, writer, http.StatusAccepted, answer(request))
+			})
+			path := filepath.Join(t.TempDir(), "app.ipa")
+			if err := os.WriteFile(path, make([]byte, ChunkSize+1), 0o600); err != nil {
+				t.Fatal(err)
+			}
 
-	if _, err := server.session(t).Upload(context.Background(), path); err == nil {
-		t.Fatal("Upload accepted a response naming another upload")
+			if _, err := server.session(t).Upload(context.Background(), path); err == nil {
+				t.Fatal("Upload succeeded without a valid id for its upload")
+			}
+			for _, request := range server.recorded()[1:] {
+				if id := request.Header.Get("X-Appwrite-Id"); id != "upload1" {
+					t.Errorf("a later chunk named %q", id)
+				}
+			}
+		})
 	}
 }
 
