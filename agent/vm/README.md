@@ -10,7 +10,7 @@ The VM layer behind RFC §9.1: `Create`, `Exec`, `Copy` and `Destroy` on a singl
 | `Exec(ctx, machine, command)` | Runs `Arguments` with `Environment` added to the guest login environment and returns the exit code. A non-zero exit is not an error. When `ctx` ends, the command's whole process group is terminated in the guest and `Exec` returns `-1` with the context's error. For `Lume`, `255` can also be ssh's own failure |
 | `Copy(ctx, machine, transfer)` | `In` copies a host file or directory into the guest; `Destination` must not be an existing directory (`ErrDestination`) and modes are preserved, so a `0600` file stays `0600`. `Out` copies one regular guest file (`ErrNotFile` for a symlink, device or directory) of at most `Limit` bytes (`ErrLimit`) into a new `0600` host file that must not exist (`ErrDestination`); a refused copy leaves nothing behind. Parents are created; relative guest paths resolve against `Machine.Home` |
 | `Destroy(ctx, machine)` | Stops and deletes the machine. Succeeds when it is already gone and on a zero `Machine`, so it can always be deferred |
-| `Sweep(ctx, prefix)` | Destroys every machine named with `prefix` that this layer did not create, with its host files. The agent runs it once at start |
+| `Sweep(ctx, prefix)` | Destroys every machine named with `prefix` that this layer did not create, with its host files. The agent runs it once at start with its runner-scoped prefix. Lume never sweeps or destroys the golden image, and refuses a prefix the golden image's name starts with |
 
 ## Fake
 
@@ -30,7 +30,7 @@ Commands, verified against the `lume-v0.7.2` sources (`libs/lume/src/Commands`).
 | Boot | `lume run <name> --display none --vnc disabled --shared-dir <per-machine>/host-key:ro`, kept running as a child of the agent; the VM lives in that process |
 | Address | `lume get <name> --format json`, polled until `status` is `running`, `ipAddress` is set and `sshAvailable` is true, a failed poll retried until the boot timeout. The address must parse as an IP literal |
 | Destroy | kill the `lume run` child, then `lume delete <name> --force`. When the agent no longer owns the child it runs `lume stop <name> --force` first. If `delete` fails, `lume ls --format json` decides whether the machine is already gone |
-| Sweep | `lume ls --format json`, then Destroy for every listed name with the prefix the agent does not own, and removal of their `vm-<name>-*` host directories |
+| Sweep | `lume ls --format json`, then Destroy for every listed name with the prefix the agent does not own, except the golden image, and removal of their `vm-<name>-*` host directories |
 
 The guest is reached with the system `/usr/bin/ssh` and `/usr/bin/scp`:
 

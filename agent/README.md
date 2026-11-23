@@ -25,7 +25,7 @@ Every flag has an environment variable; the flag wins.
 |---|---|---|---|
 | `--endpoint` | `DISTRIBUTION_AGENT_ENDPOINT` | | Appwrite endpoint including `/v1`; HTTPS unless `--allow-http` |
 | `--secret-file` | `DISTRIBUTION_AGENT_SECRET_FILE` | | File holding the enrolment secret. `DISTRIBUTION_AGENT_SECRET` works too. Read only when the state file has no credentials; never a flag value, so it stays out of `ps` |
-| `--state` | `DISTRIBUTION_AGENT_STATE` | `~/Library/Application Support/appwrite-distribution/agent.json` | Runner id and token, written atomically with mode `0600`; a state file other users can read is refused |
+| `--state` | `DISTRIBUTION_AGENT_STATE` | `~/Library/Application Support/appwrite-distribution/agent.json` | Runner id and token, written atomically with mode `0600`; a state file other users can read is refused. `<state>.lock` admits one agent per state file |
 | `--name` | `DISTRIBUTION_AGENT_NAME` | host name | |
 | `--labels` | `DISTRIBUTION_AGENT_LABELS` | | Comma-separated, such as `xcode-27.2`; for `lume`, the golden image's `vm/labels` joined with commas |
 | `--capacity` | `DISTRIBUTION_AGENT_CAPACITY` | `1` | Concurrent leases, at most 2 (the macOS licence ceiling). `lume` refuses 2 until spike S7 proves that two guests on one host cannot reach each other ([vm/README.md](../vm/README.md), host setup) |
@@ -34,7 +34,7 @@ Every flag has an environment variable; the flag wins.
 | `--ssh-key` | `DISTRIBUTION_AGENT_SSH_KEY` | | Private key the guest account authorises; required for `lume` |
 | `--ssh-user` | `DISTRIBUTION_AGENT_SSH_USER` | `lume` | The account lume's unattended setup creates, which `vm/provision.sh` runs as |
 | `--lume` | `DISTRIBUTION_AGENT_LUME` | `lume` on `PATH` | |
-| `--directory` | `DISTRIBUTION_AGENT_DIRECTORY` | `$TMPDIR/distribution-agent` | Host scratch space, one `0700` directory per lease, removed when it ends. It must be the agent user's own and mode `0700`; one agent per directory |
+| `--directory` | `DISTRIBUTION_AGENT_DIRECTORY` | `$TMPDIR/distribution-agent` | Host scratch space, one `0700` directory per lease, removed when it ends. It must be the agent user's own and mode `0700`; agents with different state files may share it |
 | `--allow-http` | `DISTRIBUTION_AGENT_ALLOW_HTTP` | `false` | Local development only |
 | `--version` | | | Prints the version set at build time with `-X main.version` |
 
@@ -42,7 +42,7 @@ Logs are JSON on standard error. Runner and lease tokens, signing material and t
 
 `DISTRIBUTION_AGENT_SECRET` is removed from the agent's environment as it starts, and every child (`lume`, `ssh`, `scp`) gets only `PATH`, `HOME`, `TMPDIR` and `LUME_TELEMETRY_ENABLED=false`. The state file must be a regular file the agent user owns, mode `0600`; it is written atomically and the directory is synced after the rename.
 
-At start the agent removes what an earlier run left behind after a crash or `kill -9`: `lease-*` scratch directories under `--directory` (which can hold signing material) and every `distribution-*` VM with its host files.
+Every VM and scratch directory the agent creates is named for its runner: VMs `distribution-<scope>-<lease id>` and scratch directories `lease-distribution-<scope>-*`, where `<scope>` is the first 12 hex characters of the SHA-256 of the runner id, logged at start as `machines`. At start the agent removes what an earlier run of the same runner left behind after a crash or `kill -9`: those scratch directories under `--directory` (which can hold signing material) and those VMs with their host files. It never touches the golden image, a rollback image, or another runner's VMs and directories, so two agents with their own state files can share a host and a `--directory`. A golden image named with the runner's own prefix makes the sweep refuse to run, and the lock beside the state file stops a second agent from starting as the same runner.
 
 SIGTERM or SIGINT drains: heartbeats report `draining`, no new lease is claimed, the leases in flight finish, and the last heartbeat reports `offline`. A second signal stops the leases in flight, which destroys their VMs; a third ends the process at once.
 

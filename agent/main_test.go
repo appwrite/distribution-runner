@@ -122,6 +122,26 @@ func TestCredentialsStateFile(t *testing.T) {
 	}
 }
 
+func TestStateLockAdmitsOneAgent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "agent.json")
+
+	first, err := lockState(path)
+	if err != nil {
+		t.Fatalf("lockState: %v", err)
+	}
+	if _, err := lockState(path); err == nil || !strings.Contains(err.Error(), "another agent") {
+		t.Fatalf("a second lock = %v, want another agent", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := lockState(path)
+	if err != nil {
+		t.Fatalf("lockState after the first agent stopped: %v", err)
+	}
+	second.Close()
+}
+
 type controlPlane struct {
 	t      *testing.T
 	server *httptest.Server

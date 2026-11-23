@@ -242,6 +242,9 @@ func (l *Lume) Destroy(ctx context.Context, machine Machine) error {
 	if err := validateName(machine.Name); err != nil {
 		return err
 	}
+	if machine.Name == l.Golden {
+		return fmt.Errorf("vm: refusing to destroy the golden image %s", machine.Name)
+	}
 	l.mutex.Lock()
 	running := l.machines[machine.Name]
 	delete(l.machines, machine.Name)
@@ -277,10 +280,16 @@ func (l *Lume) Destroy(ctx context.Context, machine Machine) error {
 }
 
 // Sweep deletes every lume machine named with prefix that this Lume does not own, and every per-machine directory
-// of such a machine.
+// of such a machine. It never deletes the golden image, and refuses a prefix the golden image's name starts with.
 func (l *Lume) Sweep(ctx context.Context, prefix string) error {
 	if err := validateName(prefix); err != nil {
 		return err
+	}
+	if err := validateName(l.Golden); err != nil {
+		return fmt.Errorf("vm: golden image: %w", err)
+	}
+	if strings.HasPrefix(l.Golden, prefix) {
+		return fmt.Errorf("vm: the golden image %q starts with the sweep prefix %q", l.Golden, prefix)
 	}
 	listed, err := l.list(ctx)
 	if err != nil {
@@ -288,7 +297,7 @@ func (l *Lume) Sweep(ctx context.Context, prefix string) error {
 	}
 	var failures []error
 	for _, entry := range listed {
-		if !strings.HasPrefix(entry.Name, prefix) || l.owned(entry.Name) {
+		if entry.Name == l.Golden || !strings.HasPrefix(entry.Name, prefix) || l.owned(entry.Name) {
 			continue
 		}
 		if err := l.Destroy(ctx, Machine{Name: entry.Name}); err != nil {

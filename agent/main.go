@@ -109,6 +109,11 @@ func run(arguments []string, lookup func(string) string, logger *slog.Logger) er
 	defer stopWork()
 	go watchSignals(logger, stopDrain, stopWork)
 
+	lock, err := lockState(settings.state)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	credentials, err := enrol(drain, client, settings, lookup, logger)
 	if err != nil {
 		return err
@@ -133,7 +138,7 @@ func run(arguments []string, lookup func(string) string, logger *slog.Logger) er
 	if err := agent.runner.Sweep(drain); err != nil {
 		logger.Warn("removing what an earlier run left behind failed", "error", err)
 	}
-	logger.Info("agent started", "version", version, "runner", credentials, "capacity", settings.capacity, "vm", settings.backend)
+	logger.Info("agent started", "version", version, "runner", credentials, "capacity", settings.capacity, "vm", settings.backend, "machines", agent.runner.Prefix()+"*")
 	if err := agent.serve(drain, work); err != nil {
 		return err
 	}
@@ -286,6 +291,26 @@ func enrolmentSecret(file string, lookup func(string) string) (string, error) {
 		return secret, nil
 	}
 	return "", errors.New("not enrolled: set " + secretVariable + " or secret-file")
+}
+
+// lockState holds an exclusive lock beside the state file until the returned file is closed, so two agents never run
+// as one runner: they would share its machine prefix and sweep each other's machines at start.
+func lockState(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(path+".lock", os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, stateMode)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		file.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("another agent is running with the state file %s", path)
+		}
+		return nil, fmt.Errorf("lock %s: %w", path, err)
+	}
+	return file, nil
 }
 
 // loadCredentials refuses a state file that is a symlink, that another user owns or that other users can read, since

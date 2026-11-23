@@ -962,15 +962,24 @@ func TestRunLosesALeaseWhoseExtensionHangs(t *testing.T) {
 
 func TestRunnerSweep(t *testing.T) {
 	h := newHarness(t, blocking(t))
-	stale := filepath.Join(h.runner.Directory, scratchPrefix+"123")
-	kept := filepath.Join(h.runner.Directory, "state.json")
-	machine := filepath.Join(h.fake.Directory, "fake-vm-"+MachinePrefix+"old-1")
-	for _, directory := range []string{stale, machine} {
+	h.runner.Image = "distribution-macos-27.0.1-xcode-27.2-r1"
+	foreign := &Runner{Credentials: protocol.Credentials{RunnerID: "other"}}
+	stale := filepath.Join(h.runner.Directory, scratchPrefix+h.runner.Prefix()+"123")
+	machine := filepath.Join(h.fake.Directory, "fake-vm-"+h.runner.Prefix()+"old-1")
+	kept := []string{
+		filepath.Join(h.runner.Directory, scratchPrefix+foreign.Prefix()+"456"),
+		filepath.Join(h.runner.Directory, scratchPrefix+"789"),
+		filepath.Join(h.fake.Directory, "fake-vm-"+foreign.Prefix()+"live-1"),
+		filepath.Join(h.fake.Directory, "fake-vm-"+h.runner.Image),
+		filepath.Join(h.fake.Directory, "fake-vm-"+MachinePrefix+"old-1"),
+	}
+	for _, directory := range append([]string{stale, machine}, kept...) {
 		if err := os.MkdirAll(filepath.Join(directory, DirectorySigning), 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(kept, nil, 0o600); err != nil {
+	state := filepath.Join(h.runner.Directory, "state.json")
+	if err := os.WriteFile(state, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -983,8 +992,42 @@ func TestRunnerSweep(t *testing.T) {
 			t.Errorf("%s survived the sweep: %v", gone, err)
 		}
 	}
-	if _, err := os.Stat(kept); err != nil {
-		t.Errorf("the sweep removed %s: %v", kept, err)
+	for _, survivor := range append(kept, state) {
+		if _, err := os.Stat(survivor); err != nil {
+			t.Errorf("the sweep removed %s, which this runner did not create: %v", survivor, err)
+		}
+	}
+}
+
+func TestRunnerPrefixIsScopedToTheRunner(t *testing.T) {
+	first := &Runner{Credentials: protocol.Credentials{RunnerID: "abc"}}
+	second := &Runner{Credentials: protocol.Credentials{RunnerID: "abc-def"}}
+
+	if first.Prefix() == second.Prefix() || strings.HasPrefix(second.Prefix(), first.Prefix()) || strings.HasPrefix(first.Prefix(), second.Prefix()) {
+		t.Fatalf("prefixes %q and %q overlap", first.Prefix(), second.Prefix())
+	}
+	if !strings.HasPrefix(first.Prefix(), MachinePrefix) || first.Prefix() != (&Runner{Credentials: protocol.Credentials{RunnerID: "abc"}}).Prefix() {
+		t.Fatalf("prefix %q is not stable under %q", first.Prefix(), MachinePrefix)
+	}
+	name := machineName(first.Prefix(), protocol.Lease{LeaseID: "lease_1.x"})
+	if name != first.Prefix()+"lease-1-x" {
+		t.Fatalf("machine name = %q", name)
+	}
+}
+
+func TestRunnerSweepRefusesAGoldenImageNamedLikeItsMachines(t *testing.T) {
+	h := newHarness(t, blocking(t))
+	h.runner.Image = h.runner.Prefix() + "golden"
+	golden := filepath.Join(h.fake.Directory, "fake-vm-"+h.runner.Image)
+	if err := os.Mkdir(golden, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.runner.Sweep(context.Background()); err == nil {
+		t.Fatal("Sweep accepted a golden image named with the runner's prefix")
+	}
+	if _, err := os.Stat(golden); err != nil {
+		t.Fatalf("the sweep removed the golden image: %v", err)
 	}
 }
 

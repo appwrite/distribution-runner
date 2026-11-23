@@ -791,6 +791,11 @@ func TestLumeCreateRetriesATransientListing(t *testing.T) {
 }
 
 func TestLumeSweep(t *testing.T) {
+	const (
+		prefix  = "distribution-0123456789ab-"
+		foreign = "distribution-ba9876543210-"
+		golden  = "distribution-macos-27.0.1-xcode-27.2-r1"
+	)
 	var listing atomic.Value
 	listing.Store("[]")
 	lume, runner := newLume(t, guest(func(process Process, _ string) (behaviour, bool) {
@@ -799,35 +804,65 @@ func TestLumeSweep(t *testing.T) {
 		}
 		return behaviour{}, false
 	}))
-	live := createLume(t, lume, "distribution-live")
-	listing.Store(`[{"name":"distribution-old"},{"name":"golden"},{"name":"distribution-live"}]`)
-	stale := filepath.Join(lume.Directory, machinePrefix+"distribution-old-123")
-	unrelated := filepath.Join(lume.Directory, machinePrefix+"golden-456")
-	for _, directory := range []string{stale, unrelated} {
+	lume.Golden = golden
+	live := createLume(t, lume, prefix+"live")
+	listing.Store(`[{"name":"` + prefix + `old"},{"name":"` + golden + `"},{"name":"distribution-macos-27.0.1-xcode-27.2-r0"},` +
+		`{"name":"` + foreign + `busy"},{"name":"` + prefix + `live"}]`)
+	stale := filepath.Join(lume.Directory, machinePrefix+prefix+"old-123")
+	kept := []string{
+		filepath.Join(lume.Directory, machinePrefix+golden+"-456"),
+		filepath.Join(lume.Directory, machinePrefix+foreign+"busy-789"),
+	}
+	for _, directory := range append([]string{stale}, kept...) {
 		if err := os.Mkdir(directory, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	if err := lume.Sweep(context.Background(), "distribution-"); err != nil {
+	if err := lume.Sweep(context.Background(), prefix); err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
 
 	deletes := runner.find(lumeCall("delete"))
-	if len(deletes) != 1 || !slices.Equal(deletes[0].Arguments, []string{"delete", "distribution-old", "--force"}) {
-		t.Fatalf("deletes = %d, want only the machine this Lume does not own", len(deletes))
+	if len(deletes) != 1 || !slices.Equal(deletes[0].Arguments, []string{"delete", prefix + "old", "--force"}) {
+		t.Fatalf("deletes = %d, want only the stale machine with this agent's prefix", len(deletes))
+	}
+	if stops := runner.find(lumeCall("stop")); len(stops) != 1 || stops[0].Arguments[1] != prefix+"old" {
+		t.Fatalf("stops = %d, want only the stale machine", len(stops))
 	}
 	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stale directory survived: %v", err)
 	}
-	if _, err := os.Stat(unrelated); err != nil {
-		t.Fatalf("an unrelated directory was removed: %v", err)
+	for _, directory := range kept {
+		if _, err := os.Stat(directory); err != nil {
+			t.Fatalf("%s was removed: %v", directory, err)
+		}
 	}
 	if _, err := lume.Exec(context.Background(), live, Command{Arguments: []string{"true"}}); err != nil {
 		t.Fatalf("the live machine did not survive the sweep: %v", err)
 	}
 	if err := lume.Sweep(context.Background(), "-x"); err == nil {
 		t.Fatal("sweep accepted an option-like prefix")
+	}
+}
+
+func TestLumeSweepNeverTouchesTheGoldenImage(t *testing.T) {
+	lume, runner := newLume(t, guest(func(process Process, _ string) (behaviour, bool) {
+		if process.Path == "lume" && process.Arguments[0] == "ls" {
+			return behaviour{stdout: `[{"name":"distribution-macos-27.0.1-xcode-27.2-r1"},{"name":"distribution-old"}]`}, true
+		}
+		return behaviour{}, false
+	}))
+	lume.Golden = "distribution-macos-27.0.1-xcode-27.2-r1"
+
+	if err := lume.Sweep(context.Background(), "distribution-"); err == nil {
+		t.Fatal("sweep accepted a prefix the golden image's name starts with")
+	}
+	if err := lume.Destroy(context.Background(), Machine{Name: lume.Golden}); err == nil {
+		t.Fatal("destroy accepted the golden image")
+	}
+	if processes := runner.all(); len(processes) != 0 {
+		t.Fatalf("started %d processes, want none: %+v", len(processes), processes[0].Arguments)
 	}
 }
 

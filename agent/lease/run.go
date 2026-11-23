@@ -4,6 +4,8 @@ package lease
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,7 +52,7 @@ const (
 	ExitTimeout = 137
 	ExitFailed  = -1
 
-	// MachinePrefix starts the name of every machine a lease runs in.
+	// MachinePrefix starts the name of every machine a lease runs in; Runner.Prefix scopes it to one runner.
 	MachinePrefix = "distribution-"
 
 	ReasonBuild        = "build"
@@ -90,6 +92,8 @@ const (
 	// bounds the source tarball, since both land on the host disk the VMs share.
 	artifactBytes = 4_000_000_000
 	scratchPrefix = "lease-"
+	// scopeBytes is how much of the runner id's SHA-256 names the runner in its machines and scratch directories.
+	scopeBytes = 6
 )
 
 var (
@@ -262,7 +266,7 @@ func (e *execution) run(ctx context.Context) (done outcome, err error) {
 	}
 
 	e.stage(StageBuild)
-	machine, err := e.runner.Layer.Create(ctx, machineName(e.lease))
+	machine, err := e.runner.Layer.Create(ctx, machineName(e.runner.Prefix(), e.lease))
 	defer e.destroy(ctx, machine)
 	if err != nil {
 		return outcome{}, e.failed(ctx, err, ReasonVM, protocol.CodeJobFailed, "", messageMachine)
@@ -639,9 +643,9 @@ func truncate(text string, limit int) string {
 	return text[:cut]
 }
 
-func machineName(lease protocol.Lease) string {
+func machineName(prefix string, lease protocol.Lease) string {
 	var builder strings.Builder
-	builder.WriteString(MachinePrefix)
+	builder.WriteString(prefix)
 	for _, character := range lease.LeaseID {
 		switch {
 		case 'a' <= character && character <= 'z', 'A' <= character && character <= 'Z', '0' <= character && character <= '9':
@@ -677,7 +681,7 @@ func (r *Runner) scratch() (string, error) {
 			return "", err
 		}
 	}
-	return os.MkdirTemp(r.Directory, scratchPrefix)
+	return os.MkdirTemp(r.Directory, scratchPrefix+r.Prefix())
 }
 
 // private refuses a directory that is a symlink, that another user owns, or that anyone else may enter.
@@ -698,10 +702,22 @@ func private(directory string) error {
 	return nil
 }
 
-// Sweep removes what an earlier agent process left behind when it crashed or was killed: lease scratch directories
-// under Directory, which can hold signing material, and every machine named for a lease. Run it before the first
-// lease, never while a lease runs.
+// Prefix starts the name of every machine and scratch directory this runner creates, and is all Sweep removes. It
+// carries a fixed-length digest of the runner id, so two agents on one host, each with its own enrolment, never sweep
+// each other's machines, and no runner's prefix starts another's.
+func (r *Runner) Prefix() string {
+	digest := sha256.Sum256([]byte(r.Credentials.RunnerID))
+	return MachinePrefix + hex.EncodeToString(digest[:scopeBytes]) + "-"
+}
+
+// Sweep removes what an earlier process of this runner left behind when it crashed or was killed: its lease scratch
+// directories under Directory, which can hold signing material, and its machines. It refuses to run when the golden
+// image carries the runner's prefix, since that would destroy it. Run it before the first lease, never while one runs.
 func (r *Runner) Sweep(ctx context.Context) error {
+	prefix := r.Prefix()
+	if strings.HasPrefix(r.Image, prefix) {
+		return fmt.Errorf("lease: the golden image %q is named like this runner's machines (%s*): rename it", r.Image, prefix)
+	}
 	var failures []error
 	if r.Directory != "" {
 		entries, err := os.ReadDir(r.Directory)
@@ -709,12 +725,12 @@ func (r *Runner) Sweep(ctx context.Context) error {
 			failures = append(failures, err)
 		}
 		for _, entry := range entries {
-			if strings.HasPrefix(entry.Name(), scratchPrefix) {
+			if strings.HasPrefix(entry.Name(), scratchPrefix+prefix) {
 				failures = append(failures, os.RemoveAll(filepath.Join(r.Directory, entry.Name())))
 			}
 		}
 	}
-	failures = append(failures, r.Layer.Sweep(ctx, MachinePrefix))
+	failures = append(failures, r.Layer.Sweep(ctx, prefix))
 	return errors.Join(failures...)
 }
 
