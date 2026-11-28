@@ -103,12 +103,15 @@ type ArtifactData struct {
 	Error           *Failure `json:"error,omitempty"`
 }
 
+// ExitData reports how the lease ended. DurationSeconds is the build script's run time; OccupancySeconds is how long
+// the lease held a VM, from the start of its creation to the end of its teardown, 0 when it never asked for one.
 type ExitData struct {
-	ExitCode        int      `json:"exitCode"`
-	Reason          string   `json:"reason,omitempty"`
-	Image           string   `json:"image"`
-	DurationSeconds float64  `json:"durationSeconds"`
-	Error           *Failure `json:"error,omitempty"`
+	ExitCode         int      `json:"exitCode"`
+	Reason           string   `json:"reason,omitempty"`
+	Image            string   `json:"image"`
+	DurationSeconds  float64  `json:"durationSeconds"`
+	OccupancySeconds float64  `json:"occupancySeconds"`
+	Error            *Failure `json:"error,omitempty"`
 }
 
 type StageData struct {

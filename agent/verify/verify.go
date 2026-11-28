@@ -45,7 +45,11 @@ func Rejected(err error) bool {
 	return false
 }
 
+// VersionNameBytes bounds the version name an IPA may keep when the lease sets none, as the server stores it.
+const VersionNameBytes = 64
+
 // Expected holds the lease values an IPA must match. Profiles maps bundle identifiers to provisioning profile bytes.
+// An empty VersionName keeps the project's version: the IPA may declare any version name of 1 to VersionNameBytes bytes.
 type Expected struct {
 	Identifier  string
 	VersionName string
@@ -102,8 +106,8 @@ func IPA(path string, expected Expected, spool string) (Result, error) {
 }
 
 func verify(path string, expected Expected, spool string, limits limits) (Result, error) {
-	if expected.Identifier == "" || expected.VersionName == "" || expected.VersionCode == "" || expected.TeamID == "" {
-		return Result{}, errors.New("verify: expected identifier, version name, version code and team id are required")
+	if expected.Identifier == "" || expected.VersionCode == "" || expected.TeamID == "" {
+		return Result{}, errors.New("verify: expected identifier, version code and team id are required")
 	}
 	file, err := os.Open(path)
 	if err != nil {
@@ -153,8 +157,11 @@ func verify(path string, expected Expected, spool string, limits limits) (Result
 	if bundle.identifier != expected.Identifier {
 		failures = append(failures, fmt.Errorf("%w: ipa has %q, lease has %q", ErrIdentifier, bundle.identifier, expected.Identifier))
 	}
-	if bundle.versionName != expected.VersionName {
+	switch {
+	case expected.VersionName != "" && bundle.versionName != expected.VersionName:
 		failures = append(failures, fmt.Errorf("%w: ipa has %q, lease has %q", ErrVersionName, bundle.versionName, expected.VersionName))
+	case expected.VersionName == "" && (bundle.versionName == "" || len(bundle.versionName) > VersionNameBytes):
+		failures = append(failures, fmt.Errorf("%w: ipa has %q, which must be 1 to %d bytes to keep the project's version", ErrVersionName, bundle.versionName, VersionNameBytes))
 	}
 	if bundle.versionCode != expected.VersionCode {
 		failures = append(failures, fmt.Errorf("%w: ipa has %q, lease has %q", ErrVersionCode, bundle.versionCode, expected.VersionCode))

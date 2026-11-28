@@ -23,11 +23,15 @@ const (
 
 const sampleImage = "appwrite/distribution-fake"
 
+// SampleVersion is the version the sample project declares, which its IPA keeps when the lease sets no version name.
+const SampleVersion = "1.0.0"
+
 // Sample stands in for the golden image's build script, given the host directory DISTRIBUTION_WORK names. It reads
 // the inputs the agent copied in and writes output/app.ipa (verify.Sample, signed for the lease's identifier, versions,
-// team and profile) and output/result.json, so a lease runs end to end without a Mac. FIXTURE_EXIT_CODE fails the
-// build with that status, FIXTURE_IDENTIFIER builds for another identifier so verification refuses it, and
-// FIXTURE_SLEEP_SECONDS delays the build. It stops, writing nothing, as soon as ctx ends.
+// team and profile; SampleVersion when the version name is empty, as a project keeps its own) and output/result.json,
+// so a lease runs end to end without a Mac. FIXTURE_EXIT_CODE fails the build with that status, FIXTURE_IDENTIFIER
+// builds for another identifier so verification refuses it, and FIXTURE_SLEEP_SECONDS delays the build. It stops,
+// writing nothing, as soon as ctx ends.
 func Sample(ctx context.Context, work string) error {
 	input := filepath.Join(work, DirectoryInput)
 	data, err := os.ReadFile(filepath.Join(input, FileEnvironment))
@@ -75,6 +79,10 @@ func Sample(ctx context.Context, work string) error {
 	if err != nil {
 		return errors.New("sample build: version code is not an integer")
 	}
+	versionName := variables[VariableVersionName]
+	if versionName == "" {
+		versionName = SampleVersion
+	}
 
 	output := filepath.Join(work, DirectoryOutput)
 	if err := os.MkdirAll(output, 0o700); err != nil {
@@ -82,7 +90,7 @@ func Sample(ctx context.Context, work string) error {
 	}
 	err = verify.Sample(filepath.Join(output, FileIPA), verify.Spec{
 		Identifier:  identifier,
-		VersionName: variables[VariableVersionName],
+		VersionName: versionName,
 		VersionCode: variables[VariableVersionCode],
 		TeamID:      variables[VariableTeamID],
 		Profile:     profile,
@@ -94,7 +102,7 @@ func Sample(ctx context.Context, work string) error {
 		"artifact":    FileIPA,
 		"type":        "ipa",
 		"identifier":  identifier,
-		"versionName": variables[VariableVersionName],
+		"versionName": versionName,
 		"versionCode": versionCode,
 		"toolchain":   map[string]any{"image": sampleImage, "fastlane": nil, "xcode": nil, "flutter": nil},
 	})

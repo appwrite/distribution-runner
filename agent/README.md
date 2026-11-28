@@ -59,7 +59,7 @@ The agent copies in `input/`, every file mode `0600`:
 | Path | Content |
 |---|---|
 | `input/source.tar.gz` | The repository tarball, downloaded on the host, never inside the VM. A provider's single-root archive, so the script strips one level |
-| `input/environment` | `export NAME='value'` lines, sorted, each `'` written as `'\''`, for the script to source. The lease's `environment`, then `DISTRIBUTION_PLATFORM`, `DISTRIBUTION_FRAMEWORK`, `DISTRIBUTION_ROOT_DIRECTORY`, `DISTRIBUTION_INSTALL_COMMAND`, `DISTRIBUTION_BUILD_COMMAND`, `DISTRIBUTION_VERSION_NAME`, `DISTRIBUTION_VERSION_CODE`, `DISTRIBUTION_TEAM_ID`, `DISTRIBUTION_BUILD_ID` and `CI=true`, which win over the lease's values. `DISTRIBUTION_IDENTIFIER` (and `DISTRIBUTION_CONFIGURATION` or `DISTRIBUTION_SCHEME`) come from the lease's `environment`. No signing material |
+| `input/environment` | `export NAME='value'` lines, sorted, each `'` written as `'\''`, for the script to source. The lease's `environment`, then `DISTRIBUTION_PLATFORM`, `DISTRIBUTION_FRAMEWORK`, `DISTRIBUTION_ROOT_DIRECTORY`, `DISTRIBUTION_INSTALL_COMMAND`, `DISTRIBUTION_BUILD_COMMAND`, `DISTRIBUTION_VERSION_NAME`, `DISTRIBUTION_VERSION_CODE`, `DISTRIBUTION_TEAM_ID`, `DISTRIBUTION_BUILD_ID` and `CI=true`, which win over the lease's values. An empty `version.name` is written as an empty `DISTRIBUTION_VERSION_NAME`, which the lane reads as "keep the project's version". `DISTRIBUTION_IDENTIFIER` (and `DISTRIBUTION_CONFIGURATION` or `DISTRIBUTION_SCHEME`) come from the lease's `environment`. No signing material |
 | `input/signing/certificate.p12` | The PKCS#12 identity |
 | `input/signing/password` | Its password, with no trailing newline |
 | `input/signing/profiles/<bundle id>.mobileprovision` | One per profile in the lease |
@@ -70,11 +70,11 @@ It then runs `/usr/local/distribution/build.sh` with only `DISTRIBUTION_WORK` in
 |---|---|---|
 | `output/app.ipa` | 4,000,000,000 bytes (RFC §14's `_APP_DISTRIBUTION_SIZE_LIMIT` default) | Required |
 | `output/result.json` | 5 MiB | Required. Only `toolchain.fastlane`, `toolchain.xcode` and `toolchain.flutter` are read; every identity field is taken from the verified IPA, and `toolchain.image` is the golden image name |
-| `output/dsyms.zip` | | Not copied yet: the protocol has no dSYM upload (open item for the server) |
+| `output/dsyms.zip` | | Not copied: the server's artifact route takes only the lease's one `.ipa` (open item for the server) |
 
 The source tarball is refused past 4,000,000,000 bytes too. Its download keeps the descriptor's headers only while redirects stay on the descriptor's host.
 
-The IPA is verified with `verify.IPA` against the lease: the identifier from `environment.DISTRIBUTION_IDENTIFIER` (which must also be a key of `signing.profiles`), `version.name`, `version.code` as `CFBundleVersion`, `signing.teamId`, the embedded profile equal to the lease's for that identifier, and each extension's or watch app's embedded profile equal to the lease's for that bundle's own `CFBundleIdentifier`. `signed` also needs a non-empty CMS signature blob, as RFC §14's inspect job requires. A hostile IPA is bounded: the bytes `archive/zip` may read to index the central directory (16 MiB), 100,000 entries, 8 slices in a universal binary, 1 MiB of entitlements, and a binary property list that may not decode to more than 16 times its size plus 1 MiB. A compressed executable is inflated into the lease's own scratch directory.
+The IPA is verified with `verify.IPA` against the lease: the identifier from `environment.DISTRIBUTION_IDENTIFIER` (which must also be a key of `signing.profiles`), `version.name` as `CFBundleShortVersionString` when the lease sets one (an empty one keeps the project's version, which must then be 1 to 64 bytes, as the server stores it), `version.code` as `CFBundleVersion`, `signing.teamId`, the embedded profile equal to the lease's for that identifier, and each extension's or watch app's embedded profile equal to the lease's for that bundle's own `CFBundleIdentifier`. `signed` also needs a non-empty CMS signature blob, as RFC §14's inspect job requires. A hostile IPA is bounded: the bytes `archive/zip` may read to index the central directory (16 MiB), 100,000 entries, 8 slices in a universal binary, 1 MiB of entitlements, and a binary property list that may not decode to more than 16 times its size plus 1 MiB. A compressed executable is inflated into the lease's own scratch directory.
 
 ## Events
 
@@ -88,13 +88,14 @@ Every lease starts with `start` and `stage {stage: "source"}`; `stage {stage: "b
 | Lease canceled by the server | `exit {exitCode: -1, reason: "canceled"}` |
 | Lease lost (extension refused, or the lease expired before an extension succeeded) | `exit {exitCode: -1, reason: "lost"}` |
 | Source download fails three times, or the source is too large | `exit {exitCode: -1, reason: "source"}`, then `artifact source` failed (`download_failed`, `download_http_error` or `archive_unknown_format`) |
-| VM create, copy in or exec fails | `exit {exitCode: -1, reason: "vm"}` |
+| The host cannot start the build: its scratch directory or input cannot be written, or the VM cannot be created or the input copied in | The lease is handed back with `PATCH …/leases/{leaseId}/status {status: "queued"}` (lease token and query headers, 204), after the events so far are delivered, and no exit is sent. If the server refuses or the call fails, `exit {exitCode: -1, reason: "vm"}` or `"agent"` instead |
+| VM exec fails | `exit {exitCode: -1, reason: "vm"}` |
 | `app.ipa` or `result.json` missing, not a regular file, too large or unreadable | `exit {exitCode: -1, reason: "output"}`, then `artifact result` failed (`artifact_not_found`, `artifact_read_failed` or `artifact_json_invalid`) |
 | Verification fails, or the verified result does not fit in one event | `exit {exitCode: -1, reason: "verification"}`, then `artifact result` failed (`artifact_failed`, message naming every mismatch) |
 | Upload fails | `exit {exitCode: -1, reason: "upload"}`, then `artifact output` failed (`upload_failed`) |
 | Invalid lease, agent error or panic | `exit {exitCode: -1, reason: "lease"}` or `"agent"` |
 
-A failure never uploads and never sends `complete`; like success, it sends the exit first and the failed artifact after it. Every failed exit carries `error {code, message}` with a known orchestrator code. The message is what the customer sees: for `vm`, `agent` and host-side `source`, `output` and `verification` errors it is a fixed sentence, and the detail, which can name host paths, is only logged. `durationSeconds` is the build script's run time whenever it ran, and 0 when the lease failed before it. An exit of 137 with reason `build` is the script killed by a signal (an OOM kill, say), not a timeout: the server must key on `reason`.
+A failure never uploads and never sends `complete`; like success, it sends the exit first and the failed artifact after it. Every failed exit carries `error {code, message}` with a known orchestrator code. The message is what the customer sees: for `vm`, `agent` and host-side `source`, `output` and `verification` errors it is a fixed sentence, and the detail, which can name host paths, is only logged. `durationSeconds` is the build script's run time whenever it ran, and 0 when the lease failed before it. `occupancySeconds` is the VM occupancy RFC §17 bills: from the start of the VM's creation to the end of its teardown, so it covers setup, build, copy out, verification and upload, and is 0 when the lease ended before asking for a VM. The VM is destroyed before the exit is sent, so every exit carries its final value. An exit of 137 with reason `build` is the script killed by a signal (an OOM kill, say), not a timeout: the server must key on `reason`.
 
 Build output is capped at 50,000,000 bytes per lease, the server's default `_APP_DISTRIBUTION_LOGS_LIMIT`, with each line charged 16 bytes on top of its own so a flood of empty lines is capped too: past it one `stderr` truncation line is sent and the rest dropped. While 16 MiB of output is undelivered, queued or in a send that has not succeeded yet (a slow or failing server), the agent stops reading the guest's output, which pushes back through ssh to the build.
 
@@ -114,6 +115,8 @@ The `result` content:
 }
 ```
 
+`versionName` and `buildNumber` are the verified IPA's `CFBundleShortVersionString` and `CFBundleVersion`, so when the lease's `version.name` is empty `versionName` is the version the project kept. `versionCode` is the lease's `version.code`.
+
 The lease is extended every third of its remaining time.
 
 ## Running without a Mac
@@ -126,6 +129,8 @@ The lease is extended every third of its remaining time.
 | `FIXTURE_IDENTIFIER` | The IPA is built for this identifier, so verification refuses it |
 | `FIXTURE_SLEEP_SECONDS` | The build takes this long, to drill timeouts and cancellation; it stops as soon as the lease does |
 
+A lease with an empty `version.name` gets an IPA versioned `1.0.0` (`lease.SampleVersion`), the version the sample project keeps.
+
 ```
 DISTRIBUTION_AGENT_SECRET=... go run . --vm fake --allow-http true \
   --endpoint http://localhost/v1 --state /tmp/agent.json
@@ -135,5 +140,6 @@ DISTRIBUTION_AGENT_SECRET=... go run . --vm fake --allow-http true \
 
 - The lume adapter (spike S7), including per-machine host keys; see [vm/README.md](vm/README.md).
 - Event data shapes, the upload field name, the server-named upload id and the clean-up of abandoned uploads (above), and the `result` content are pending the server's lease events and artifacts actions (m4b).
-- A route to requeue a lease that failed on the host instead of failing the build (m4b).
+- The exit's `occupancySeconds`: the server's `JobExit` decoder ignores it, so nothing bills VM occupancy yet (m5b).
+- dSYM upload: the server has no dSYM artifact type (m5b).
 - No lease has run end to end on a real Mac.

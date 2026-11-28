@@ -66,9 +66,11 @@ type server struct {
 	events   []event
 	uploaded bytes.Buffer
 	sources  int
-	// extend answers PATCH on the lease; source returns the descriptor for the nth request, from 1.
-	extend func() protocol.Extension
-	source func(count int) protocol.Source
+	// extend answers PATCH on the lease; source returns the descriptor for the nth request, from 1; requeue is the
+	// status that answers handing the lease back, 204 by default.
+	extend  func() protocol.Extension
+	source  func(count int) protocol.Source
+	requeue func() int
 }
 
 func newServer(t *testing.T) *server {
@@ -76,6 +78,7 @@ func newServer(t *testing.T) *server {
 	fake := &server{t: t}
 	mux := http.NewServeMux()
 	mux.HandleFunc("PATCH "+leasePath, fake.serveExtend)
+	mux.HandleFunc("PATCH "+leasePath+"/status", fake.serveRequeue)
 	mux.HandleFunc("POST "+leasePath+"/events", fake.serveEvents)
 	mux.HandleFunc("POST "+leasePath+"/artifacts", fake.serveUpload)
 	mux.HandleFunc("GET "+leasePath+"/source", fake.serveSource)
@@ -101,6 +104,24 @@ func (s *server) serveExtend(writer http.ResponseWriter, _ *http.Request) {
 		extension = s.extend()
 	}
 	respond(writer, http.StatusOK, extension)
+}
+
+func (s *server) serveRequeue(writer http.ResponseWriter, _ *http.Request) {
+	status := http.StatusNoContent
+	if s.requeue != nil {
+		status = s.requeue()
+	}
+	writer.WriteHeader(status)
+}
+
+func (s *server) requeues() []recorded {
+	var requeues []recorded
+	for _, request := range s.recorded() {
+		if request.Method == http.MethodPatch && request.URL == leasePath+"/status" {
+			requeues = append(requeues, request)
+		}
+	}
+	return requeues
 }
 
 func (s *server) serveEvents(writer http.ResponseWriter, request *http.Request) {
@@ -472,7 +493,7 @@ func TestRunSuccess(t *testing.T) {
 		}
 	}
 	exit := exitData(t, received[3])
-	if exit.ExitCode != 0 || exit.Image != testImage || exit.Error != nil {
+	if exit.ExitCode != 0 || exit.Image != testImage || exit.Error != nil || exit.OccupancySeconds < exit.DurationSeconds {
 		t.Errorf("exit = %+v", exit)
 	}
 
@@ -565,6 +586,195 @@ func TestRunSuccess(t *testing.T) {
 		if mode, ok := modes[name]; !ok || mode != 0o600 {
 			t.Errorf("%s mode = %v (present %v), want 0600", name, mode, ok)
 		}
+	}
+}
+
+func TestRunKeepsTheProjectVersion(t *testing.T) {
+	var environment []byte
+	h := newHarness(t, func(ctx context.Context, work string, _ map[string]string) error {
+		var err error
+		if environment, err = os.ReadFile(filepath.Join(work, DirectoryInput, FileEnvironment)); err != nil {
+			return err
+		}
+		return Sample(ctx, work)
+	})
+	lease := h.server.lease()
+	lease.Version.Name = ""
+
+	if err := h.runner.Run(context.Background(), lease); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	variables, err := ParseEnvironment(environment)
+	if err != nil {
+		t.Fatalf("parse input/environment: %v", err)
+	}
+	if name, ok := variables[VariableVersionName]; !ok || name != "" {
+		t.Errorf("input/environment %s = %q (present %v), want it empty so the lane keeps the project's version", VariableVersionName, name, ok)
+	}
+	var resultEvent struct {
+		Content result `json:"content"`
+	}
+	if err := json.Unmarshal(h.server.find(t, protocol.TypeArtifact, resultArtifact).Data, &resultEvent); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if content := resultEvent.Content; content.VersionName != SampleVersion || content.BuildNumber != "57" || content.VersionCode != 57 {
+		t.Errorf("result versions = %q, %q, %d, want the ipa's %q and 57", content.VersionName, content.BuildNumber, content.VersionCode, SampleVersion)
+	}
+	if types := h.server.types(); types[len(types)-1] != protocol.TypeComplete {
+		t.Errorf("events = %v, want complete last", types)
+	}
+}
+
+func TestRunStillVerifiesAVersionNameTheLeaseSets(t *testing.T) {
+	h := newHarness(t, func(ctx context.Context, work string, _ map[string]string) error {
+		if err := Sample(ctx, work); err != nil {
+			return err
+		}
+		return verify.Sample(filepath.Join(work, DirectoryOutput, FileIPA), verify.Spec{
+			Identifier: testIdentifier, VersionName: SampleVersion, VersionCode: "57", TeamID: testTeam,
+			Profile: []byte("profile-sentinel-a9f0"),
+		})
+	})
+
+	err := h.runner.Run(context.Background(), h.server.lease())
+
+	failed := assertFailure(t, err, ReasonVerification)
+	if !errors.Is(failed, verify.ErrVersionName) {
+		t.Errorf("failure %v does not match verify.ErrVersionName", failed)
+	}
+	h.assertNoUpload(t)
+}
+
+func TestRunHandsBackALeaseItCannotStart(t *testing.T) {
+	cases := []struct {
+		name    string
+		reason  string
+		fail    func(vm.Call) error
+		prepare func(*testing.T, *harness)
+	}{
+		{
+			name:   "vm unavailable",
+			reason: ReasonVM,
+			fail: func(call vm.Call) error {
+				if call.Operation == vm.OperationCreate {
+					return errors.New("lume: no capacity")
+				}
+				return nil
+			},
+		},
+		{
+			name:   "copy in fails",
+			reason: ReasonVM,
+			fail: func(call vm.Call) error {
+				if call.Operation == vm.OperationCopy && call.Transfer.Direction == vm.In {
+					return errors.New("scp: connection reset")
+				}
+				return nil
+			},
+		},
+		{
+			name:   "scratch directory unusable",
+			reason: ReasonAgent,
+			prepare: func(t *testing.T, h *harness) {
+				if err := os.Chmod(h.runner.Directory, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			h := newHarness(t, blocking(t))
+			h.fake.Fail = test.fail
+			if test.prepare != nil {
+				test.prepare(t, h)
+			}
+
+			err := h.runner.Run(context.Background(), h.server.lease())
+
+			failed := assertFailure(t, err, test.reason)
+			if !failed.requeue || !Infrastructure(err) {
+				t.Errorf("failure %+v, want a host failure handed back", failed)
+			}
+			requeues := h.server.requeues()
+			if len(requeues) != 1 {
+				t.Fatalf("requeue requests = %d, want 1", len(requeues))
+			}
+			if body := string(requeues[0].Body); body != `{"status":"queued"}` {
+				t.Errorf("requeue body = %s", body)
+			}
+			if got := requeues[0].Header.Get("Authorization"); got != "Bearer "+testLeaseToken {
+				t.Errorf("requeue Authorization = %q", got)
+			}
+			if got := requeues[0].Header.Get("X-Appwrite-Project"); got != "project1" {
+				t.Errorf("requeue X-Appwrite-Project = %q", got)
+			}
+			if types := h.server.types(); slices.Contains(types, protocol.TypeExit) || slices.Contains(types, protocol.TypeArtifact) {
+				t.Errorf("events = %v, want no exit or artifact for a lease handed back", types)
+			}
+			recorded := h.server.recorded()
+			if last := recorded[len(recorded)-1]; last.Method != http.MethodPatch || last.URL != leasePath+"/status" {
+				t.Errorf("last request = %s %s, want the requeue after the events reported so far", last.Method, last.URL)
+			}
+			if slices.Contains(h.operations(), vm.OperationExec) {
+				t.Errorf("the build ran: %v", h.operations())
+			}
+			h.assertNoUpload(t)
+			if live := h.fake.Live(); len(live) != 0 {
+				t.Errorf("machines left running: %v", live)
+			}
+		})
+	}
+}
+
+func TestRunDoesNotHandBackAStartedBuild(t *testing.T) {
+	h := newHarness(t, blocking(t))
+	h.fake.Fail = func(call vm.Call) error {
+		if call.Operation == vm.OperationExec {
+			return errors.New("ssh: connection lost")
+		}
+		return nil
+	}
+
+	err := h.runner.Run(context.Background(), h.server.lease())
+
+	failed := assertFailure(t, err, ReasonVM)
+	if failed.requeue || len(h.server.requeues()) != 0 {
+		t.Errorf("a build that started was handed back")
+	}
+	if exit := exitData(t, h.server.find(t, protocol.TypeExit, "")); exit.Reason != ReasonVM || exit.ExitCode != ExitFailed {
+		t.Errorf("exit = %+v", exit)
+	}
+	h.assertDestroyed(t)
+}
+
+func TestRunReportsVMOccupancy(t *testing.T) {
+	const teardown = 150 * time.Millisecond
+	cases := map[string]func(context.Context, string, map[string]string) error{
+		"success": func(ctx context.Context, work string, _ map[string]string) error { return Sample(ctx, work) },
+		"build failure": func(context.Context, string, map[string]string) error {
+			time.Sleep(20 * time.Millisecond)
+			return &vm.ExitError{Code: 65}
+		},
+	}
+	for name, build := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, build)
+			h.fake.Fail = func(call vm.Call) error {
+				if call.Operation == vm.OperationDestroy {
+					time.Sleep(teardown)
+				}
+				return nil
+			}
+
+			_ = h.runner.Run(context.Background(), h.server.lease())
+
+			exit := exitData(t, h.server.find(t, protocol.TypeExit, ""))
+			if exit.DurationSeconds <= 0 || exit.OccupancySeconds < exit.DurationSeconds+teardown.Seconds() {
+				t.Errorf("exit = %+v, want an occupancy covering the build and the %v teardown", exit, teardown)
+			}
+		})
 	}
 }
 
@@ -677,6 +887,12 @@ func TestRunSourceFailure(t *testing.T) {
 	err := h.runner.Run(context.Background(), h.server.lease())
 
 	assertFailure(t, err, "source")
+	if exit := exitData(t, h.server.find(t, protocol.TypeExit, "")); exit.OccupancySeconds != 0 {
+		t.Errorf("exit = %+v, want no vm occupancy before a vm was asked for", exit)
+	}
+	if len(h.server.requeues()) != 0 {
+		t.Errorf("a source failure handed the lease back")
+	}
 	var artifact protocol.ArtifactData
 	_ = json.Unmarshal(h.server.find(t, protocol.TypeArtifact, sourceArtifact).Data, &artifact)
 	if artifact.Status != protocol.ArtifactFailed || artifact.Error == nil || artifact.Error.Code != protocol.CodeDownloadHTTPError {
@@ -811,10 +1027,14 @@ func TestRunHidesHostDetailsFromInfrastructureFailures(t *testing.T) {
 		}
 		return nil
 	}
+	h.server.requeue = func() int { return http.StatusNotFound }
 
 	err := h.runner.Run(context.Background(), h.server.lease())
 
 	failed := assertFailure(t, err, ReasonVM)
+	if len(h.server.requeues()) != 1 {
+		t.Errorf("requeue requests = %d, want 1 before falling back to an exit", len(h.server.requeues()))
+	}
 	exit := exitData(t, h.server.find(t, protocol.TypeExit, ""))
 	if exit.Error == nil || exit.Error.Message != messageMachine || exit.DurationSeconds != 0 {
 		t.Errorf("exit = %+v, want the generic message and no run time", exit)

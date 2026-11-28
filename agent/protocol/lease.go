@@ -14,6 +14,9 @@ import (
 	"time"
 )
 
+// LeaseQueued is the lease status Requeue sets, the only one the server accepts from a runner.
+const LeaseQueued = "queued"
+
 // Lease is a claimed build. Claim moves ExpiresAt onto the host clock.
 type Lease struct {
 	LeaseID     string      `json:"leaseId"`
@@ -181,6 +184,24 @@ func (s *Session) Extend(ctx context.Context) (Extension, error) {
 	}
 	extension.ExpiresAt = hostTime(extension.ExpiresAt, response.Header)
 	return extension, nil
+}
+
+// Requeue hands the lease back, so the server queues its build again at once instead of when the lease expires. It is
+// for a lease this host cannot run, such as when its VM is unavailable before the build starts: the lease ends, and no
+// exit is reported for it.
+func (s *Session) Requeue(ctx context.Context) error {
+	body, err := json.Marshal(struct {
+		Status string `json:"status"`
+	}{LeaseQueued})
+	if err != nil {
+		return err
+	}
+	response, err := s.client.send(ctx, jsonCall(s.call(http.MethodPatch, "/status"), body))
+	if err != nil {
+		return err
+	}
+	discard(response)
+	return nil
 }
 
 // Source asks for a fresh download descriptor; ask again after a failed download, because the URL expires within minutes.

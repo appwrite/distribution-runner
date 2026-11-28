@@ -120,8 +120,9 @@ type Runner struct {
 	Grace    time.Duration
 }
 
-// failure is a run that ended without a build: it becomes a non-zero exit and an optional failed artifact event.
-// message is what the customer sees; cause, which can carry host details, is only logged.
+// failure is a run that ended without a build: it becomes a non-zero exit and an optional failed artifact event, or,
+// when requeue is set, the lease handed back so another attempt runs it. message is what the customer sees; cause,
+// which can carry host details, is only logged.
 type failure struct {
 	exit     int
 	reason   string
@@ -130,6 +131,7 @@ type failure struct {
 	artifact string
 	kind     string
 	cause    error
+	requeue  bool
 }
 
 func (f *failure) Error() string {
@@ -154,6 +156,7 @@ type execution struct {
 	reporter *protocol.Reporter
 	logger   *slog.Logger
 	elapsed  time.Duration
+	occupied time.Duration
 }
 
 type result struct {
@@ -217,6 +220,10 @@ func (r *Runner) Run(ctx context.Context, lease protocol.Lease) error {
 		if !errors.As(err, &failed) {
 			failed = &failure{exit: ExitFailed, reason: ReasonAgent, code: protocol.CodeJobFailed, message: messageAgent, cause: err}
 		}
+		if failed.requeue && execution.requeue(ctx) {
+			logger.Warn("lease handed back", "reason", failed.reason, "error", failed.message, "cause", failed.cause)
+			return failed
+		}
 		execution.report(failed)
 		logger.Warn("lease failed", "reason", failed.reason, "exitCode", failed.exit, "error", failed.message, "cause", failed.cause)
 		return failed
@@ -252,24 +259,25 @@ func (e *execution) run(ctx context.Context) (done outcome, err error) {
 
 	scratch, err := e.runner.scratch()
 	if err != nil {
-		return outcome{}, e.failed(ctx, err, ReasonAgent, protocol.CodeJobFailed, "", messageAgent)
+		return outcome{}, e.unavailable(ctx, err, ReasonAgent, messageAgent)
 	}
 	defer os.RemoveAll(scratch)
 	input := filepath.Join(scratch, DirectoryInput)
 
 	e.stage(StageSource)
 	if err := writeInput(input, e.lease, variables); err != nil {
-		return outcome{}, e.failed(ctx, err, ReasonAgent, protocol.CodeJobFailed, "", messageAgent)
+		return outcome{}, e.unavailable(ctx, err, ReasonAgent, messageAgent)
 	}
 	if err := e.fetch(ctx, filepath.Join(input, FileSource)); err != nil {
 		return outcome{}, err
 	}
 
 	e.stage(StageBuild)
+	created := time.Now()
 	machine, err := e.runner.Layer.Create(ctx, machineName(e.runner.Prefix(), e.lease))
-	defer e.destroy(ctx, machine)
+	defer e.destroy(ctx, machine, created)
 	if err != nil {
-		return outcome{}, e.failed(ctx, err, ReasonVM, protocol.CodeJobFailed, "", messageMachine)
+		return outcome{}, e.unavailable(ctx, err, ReasonVM, messageMachine)
 	}
 	work := path.Join(machine.Home, Work)
 	err = e.runner.Layer.Copy(ctx, machine, vm.Transfer{Direction: vm.In, Source: input, Destination: path.Join(work, DirectoryInput)})
@@ -277,7 +285,7 @@ func (e *execution) run(ctx context.Context) (done outcome, err error) {
 		e.logger.Warn("removing the host copy of the lease input failed", "error", removeErr)
 	}
 	if err != nil {
-		return outcome{}, e.failed(ctx, err, ReasonVM, protocol.CodeJobFailed, "", messageMachine)
+		return outcome{}, e.unavailable(ctx, err, ReasonVM, messageMachine)
 	}
 
 	if err := e.build(ctx, machine, work); err != nil {
@@ -392,6 +400,7 @@ func copyFailure(name string, limit int64, err error) (protocol.Code, string) {
 }
 
 // expected checks the lease carries what verification needs, the identifier cross-checked against the profile keys.
+// An empty version name keeps the project's version, which the IPA then reports.
 func (e *execution) expected() (verify.Expected, error) {
 	identifier := e.lease.Environment[VariableIdentifier]
 	signing := e.lease.Signing
@@ -402,8 +411,8 @@ func (e *execution) expected() (verify.Expected, error) {
 		return verify.Expected{}, errors.New("lease has no signing team")
 	case len(signing.Certificate) == 0:
 		return verify.Expected{}, errors.New("lease has no signing certificate")
-	case e.lease.Version.Name == "" || e.lease.Version.Code <= 0:
-		return verify.Expected{}, errors.New("lease has no version name or code")
+	case e.lease.Version.Code <= 0:
+		return verify.Expected{}, errors.New("lease has no version code")
 	}
 	if _, ok := signing.Profiles[identifier]; !ok {
 		return verify.Expected{}, fmt.Errorf("lease has no provisioning profile for %s", identifier)
@@ -441,6 +450,32 @@ func (e *execution) failed(ctx context.Context, err error, reason string, code p
 	return &failure{exit: ExitFailed, reason: reason, code: code, message: message, artifact: artifact, kind: kind, cause: err}
 }
 
+// unavailable is a failure of this host before the build started, which another attempt need not share: the lease
+// is handed back rather than failed, unless the run was stopped, in which case the stop is the failure.
+func (e *execution) unavailable(ctx context.Context, err error, reason string, message string) error {
+	if stopped := stopped(ctx); stopped != nil {
+		stopped.cause = err
+		return stopped
+	}
+	return &failure{exit: ExitFailed, reason: reason, code: protocol.CodeJobFailed, message: message, cause: err, requeue: true}
+}
+
+// requeue delivers the events reported so far, then hands the lease back. It reports whether the server took the lease
+// back; when it did not, the caller reports the failure as an exit instead, so the build does not wait for the lease
+// to expire.
+func (e *execution) requeue(ctx context.Context) bool {
+	requeuing, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
+	defer cancel()
+	if err := e.reporter.Flush(requeuing); err != nil {
+		e.logger.Warn("reporting lease events before handing the lease back failed", "error", err)
+	}
+	if err := e.session.Requeue(requeuing); err != nil {
+		e.logger.Warn("handing the lease back failed: reporting the failure instead", "error", err)
+		return false
+	}
+	return true
+}
+
 const (
 	messageAgent   = "the agent failed"
 	messageMachine = "the build machine failed"
@@ -471,15 +506,16 @@ func stopped(ctx context.Context) *failure {
 }
 
 // report sends the exit, as success does, then the failed artifact. durationSeconds is the build script's run time
-// whenever it ran, and 0 when the run failed before it.
+// whenever it ran, and 0 when the run failed before it; occupancySeconds is the VM's, 0 when none was asked for.
 func (e *execution) report(failed *failure) {
 	reported := protocol.Failure{Code: failed.code, Message: truncate(failed.message, messageBytes)}
 	e.reporter.Emit(protocol.Event{Type: protocol.TypeExit, Data: protocol.ExitData{
-		ExitCode:        failed.exit,
-		Reason:          failed.reason,
-		Image:           e.runner.Image,
-		DurationSeconds: e.elapsed.Seconds(),
-		Error:           &reported,
+		ExitCode:         failed.exit,
+		Reason:           failed.reason,
+		Image:            e.runner.Image,
+		DurationSeconds:  e.elapsed.Seconds(),
+		OccupancySeconds: e.occupied.Seconds(),
+		Error:            &reported,
 	}})
 	if failed.artifact != "" {
 		e.reporter.Emit(protocol.Event{Type: protocol.TypeArtifact, Data: protocol.ArtifactData{
@@ -494,9 +530,10 @@ func (e *execution) report(failed *failure) {
 func (e *execution) succeed(done outcome) {
 	uploaded := done.upload.Seconds()
 	e.reporter.Emit(protocol.Event{Type: protocol.TypeExit, Data: protocol.ExitData{
-		ExitCode:        0,
-		Image:           e.runner.Image,
-		DurationSeconds: e.elapsed.Seconds(),
+		ExitCode:         0,
+		Image:            e.runner.Image,
+		DurationSeconds:  e.elapsed.Seconds(),
+		OccupancySeconds: e.occupied.Seconds(),
 	}})
 	e.reporter.Emit(resultEvent(done.content, done.verify))
 	e.reporter.Emit(protocol.Event{Type: protocol.TypeArtifact, Data: protocol.ArtifactData{
@@ -524,13 +561,15 @@ func (e *execution) stage(stage string) {
 	e.reporter.Emit(protocol.Event{Type: protocol.TypeStage, Data: protocol.StageData{Stage: stage}})
 }
 
-// destroy runs with its own bounded context, so a cancelled, timed out or panicking run still removes the VM.
-func (e *execution) destroy(ctx context.Context, machine vm.Machine) {
+// destroy runs with its own bounded context, so a cancelled, timed out or panicking run still removes the VM. It
+// records the VM's occupancy: from created, when its creation started, to the end of its teardown.
+func (e *execution) destroy(ctx context.Context, machine vm.Machine, created time.Time) {
 	destroying, cancel := context.WithTimeout(context.WithoutCancel(ctx), positive(e.runner.Grace, defaultGrace))
 	defer cancel()
 	if err := e.runner.Layer.Destroy(destroying, machine); err != nil {
 		e.logger.Error("destroying the vm failed", "machine", machine.Name, "error", err)
 	}
+	e.occupied = time.Since(created)
 }
 
 // extend renews the lease every third of its remaining time. It cancels the run when the server cancels the lease,

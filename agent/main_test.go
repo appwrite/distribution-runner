@@ -148,18 +148,23 @@ type controlPlane struct {
 
 	// claim chooses the status of the nth claim, from 1: 201 hands out the lease. By default only the first does.
 	claim func(count int) int
+	// versionName is the lease's version name, "1.0.0" by default.
+	versionName string
 
 	mutex      sync.Mutex
 	enrolments int
 	statuses   []string
 	claims     int
+	requeues   int
 	events     []string
+	payloads   []json.RawMessage
 	done       chan struct{}
+	requeued   chan struct{}
 }
 
 func newControlPlane(t *testing.T) *controlPlane {
 	t.Helper()
-	plane := &controlPlane{t: t, done: make(chan struct{})}
+	plane := &controlPlane{t: t, versionName: "1.0.0", done: make(chan struct{}), requeued: make(chan struct{})}
 	mux := http.NewServeMux()
 	runner := "/v1/distribution/runners/runner1"
 	leasePath := runner + "/leases/lease1"
@@ -202,16 +207,36 @@ func newControlPlane(t *testing.T) *controlPlane {
 	mux.HandleFunc("PATCH "+leasePath, func(writer http.ResponseWriter, _ *http.Request) {
 		reply(writer, http.StatusOK, protocol.Extension{ExpiresAt: time.Now().Add(time.Hour)})
 	})
+	mux.HandleFunc("PATCH "+leasePath+"/status", func(writer http.ResponseWriter, request *http.Request) {
+		var body struct {
+			Status string `json:"status"`
+		}
+		_ = json.NewDecoder(request.Body).Decode(&body)
+		if body.Status != protocol.LeaseQueued || request.Header.Get("Authorization") != "Bearer lease-token" {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		plane.mutex.Lock()
+		plane.requeues++
+		if plane.requeued != nil {
+			close(plane.requeued)
+			plane.requeued = nil
+		}
+		plane.mutex.Unlock()
+		writer.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("POST "+leasePath+"/events", func(writer http.ResponseWriter, request *http.Request) {
 		var batch struct {
 			Events []struct {
-				Type string `json:"type"`
+				Type string          `json:"type"`
+				Data json.RawMessage `json:"data"`
 			} `json:"events"`
 		}
 		_ = json.NewDecoder(request.Body).Decode(&batch)
 		plane.mutex.Lock()
 		for _, received := range batch.Events {
 			plane.events = append(plane.events, received.Type)
+			plane.payloads = append(plane.payloads, received.Data)
 			if received.Type == protocol.TypeComplete && plane.done != nil {
 				close(plane.done)
 				plane.done = nil
@@ -250,7 +275,7 @@ func (p *controlPlane) lease() map[string]any {
 			"profiles":    map[string]string{"com.example.app": base64.StdEncoding.EncodeToString([]byte("profile"))},
 			"teamId":      "ABCDE12345",
 		},
-		"version": map[string]any{"name": "1.0.0", "code": 7},
+		"version": map[string]any{"name": p.versionName, "code": 7},
 	}
 }
 
@@ -320,6 +345,109 @@ func TestAgentRunsLeaseWithFakeVM(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "runner-token") || strings.Contains(logs.String(), "lease-token") {
 		t.Errorf("logs contain a token:\n%s", logs.String())
+	}
+}
+
+// fakeAgent is the agent run() builds for --vm fake --allow-http against plane, with the fake VM layer it runs on.
+func fakeAgent(t *testing.T, plane *controlPlane) (*agent, *vm.Fake) {
+	t.Helper()
+	directory := t.TempDir()
+	settings, err := parse([]string{
+		"--endpoint", plane.server.URL + "/v1", "--allow-http", "true", "--vm", backendFake,
+		"--state", filepath.Join(directory, "agent.json"), "--directory", filepath.Join(directory, "work"),
+	}, lookup(nil), io.Discard)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	client, err := protocol.New(settings.endpoint, nil, settings.allowHTTP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer, image := backend(settings)
+	machines, ok := layer.(*vm.Fake)
+	if !ok {
+		t.Fatalf("backend = %T, want the fake vm", layer)
+	}
+	credentials := protocol.Credentials{RunnerID: "runner1", Token: "runner-token"}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return &agent{
+		client: client, credentials: credentials, labels: settings.labels, capacity: 1, logger: logger,
+		runner: &lease.Runner{Client: client, Credentials: credentials, Layer: layer, Image: image,
+			Directory: settings.directory, AllowHTTP: true, Logger: logger, Interval: 10 * time.Millisecond},
+	}, machines
+}
+
+// serveUntil runs the agent until signal closes, then drains it.
+func serveUntil(t *testing.T, agent *agent, signal <-chan struct{}) {
+	t.Helper()
+	drain, stopDrain := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-signal:
+		case <-time.After(20 * time.Second):
+			t.Error("the lease did not end within 20s")
+		}
+		stopDrain()
+	}()
+	if err := agent.serve(drain, context.Background()); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+}
+
+func TestAgentKeepsTheProjectVersionWithFakeVM(t *testing.T) {
+	plane := newControlPlane(t)
+	plane.versionName = ""
+	agent, _ := fakeAgent(t, plane)
+
+	serveUntil(t, agent, plane.done)
+
+	plane.mutex.Lock()
+	defer plane.mutex.Unlock()
+	want := []string{protocol.TypeStart, protocol.TypeStage, protocol.TypeStage, protocol.TypeExit, protocol.TypeArtifact, protocol.TypeArtifact, protocol.TypeComplete}
+	if !slices.Equal(plane.events, want) {
+		t.Fatalf("events = %v, want %v", plane.events, want)
+	}
+	var exit protocol.ExitData
+	if err := json.Unmarshal(plane.payloads[3], &exit); err != nil {
+		t.Fatalf("decode exit: %v", err)
+	}
+	if exit.ExitCode != 0 || exit.OccupancySeconds <= 0 || exit.OccupancySeconds < exit.DurationSeconds {
+		t.Errorf("exit = %+v, want a vm occupancy covering the build", exit)
+	}
+	var result struct {
+		ArtifactID string `json:"artifactId"`
+		Content    struct {
+			VersionName string `json:"versionName"`
+			BuildNumber string `json:"buildNumber"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(plane.payloads[4], &result); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if result.ArtifactID != "result" || result.Content.VersionName != lease.SampleVersion || result.Content.BuildNumber != "7" {
+		t.Errorf("result = %+v, want the ipa's own version %q and build number 7", result, lease.SampleVersion)
+	}
+}
+
+func TestAgentHandsBackALeaseWhenTheFakeVMIsUnavailable(t *testing.T) {
+	plane := newControlPlane(t)
+	agent, machines := fakeAgent(t, plane)
+	machines.Fail = func(call vm.Call) error {
+		if call.Operation == vm.OperationCreate {
+			return errors.New("no vm capacity")
+		}
+		return nil
+	}
+
+	serveUntil(t, agent, plane.requeued)
+
+	plane.mutex.Lock()
+	defer plane.mutex.Unlock()
+	if plane.requeues != 1 {
+		t.Errorf("requeues = %d, want 1", plane.requeues)
+	}
+	if slices.Contains(plane.events, protocol.TypeExit) {
+		t.Errorf("events = %v, want no exit for a lease handed back", plane.events)
 	}
 }
 
@@ -424,6 +552,9 @@ func TestAgentDrainsAfterRepeatedHostFailures(t *testing.T) {
 	defer plane.mutex.Unlock()
 	if claims != failureLimit || plane.claims != failureLimit {
 		t.Errorf("claimed %d then %d times, want %d", claims, plane.claims, failureLimit)
+	}
+	if plane.requeues != failureLimit || slices.Contains(plane.events, protocol.TypeExit) {
+		t.Errorf("requeues = %d with events %v, want every lease handed back without an exit", plane.requeues, plane.events)
 	}
 	if plane.statuses[len(plane.statuses)-1] != protocol.StatusOffline {
 		t.Errorf("heartbeats = %v, want offline last", plane.statuses)

@@ -2,10 +2,12 @@ package protocol
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -167,5 +169,54 @@ func TestSourceRequiresHTTPS(t *testing.T) {
 
 	if _, err := session.Source(context.Background()); err == nil {
 		t.Error("Source accepted an http url without allowHTTP")
+	}
+}
+
+func TestRequeueHandsTheLeaseBack(t *testing.T) {
+	server := newFake(t)
+	server.handle("PATCH "+leasePath+"/status", func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	})
+
+	if err := server.session(t).Requeue(context.Background()); err != nil {
+		t.Fatalf("Requeue: %v", err)
+	}
+
+	requests := server.matching(http.MethodPatch, leasePath+"/status")
+	if len(requests) != 1 {
+		t.Fatalf("requeue requests = %d, want 1", len(requests))
+	}
+	request := requests[0]
+	bearer(t, request, testLeaseToken)
+	if got := request.Header.Get("X-Appwrite-Project"); got != testProject {
+		t.Errorf("X-Appwrite-Project = %q, want %q", got, testProject)
+	}
+	if got := request.Header.Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q", got)
+	}
+	if string(request.Body) != `{"status":"queued"}` {
+		t.Errorf("body = %s, want the queued status", request.Body)
+	}
+}
+
+func TestRequeueRetriesServerErrorsAndReportsRefusals(t *testing.T) {
+	server := newFake(t)
+	var attempts atomic.Int32
+	server.handle("PATCH "+leasePath+"/status", func(writer http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		respond(t, writer, http.StatusNotFound, map[string]string{"message": "Lease not found.", "type": "distribution_lease_not_found"})
+	})
+
+	err := server.session(t).Requeue(context.Background())
+
+	var response *ResponseError
+	if !errors.As(err, &response) || response.Status != http.StatusNotFound || !response.Permanent() {
+		t.Fatalf("Requeue = %v, want the permanent 404", err)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Errorf("attempts = %d, want the 503 retried once", got)
 	}
 }

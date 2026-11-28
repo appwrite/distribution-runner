@@ -262,6 +262,27 @@ func TestMismatch(t *testing.T) {
 		{name: "wrong version name", spec: func(spec *Spec) { spec.VersionName = "1.2.4" }, errors: []error{ErrVersionName}, signed: true},
 		{name: "wrong version code", spec: func(spec *Spec) { spec.VersionCode = "46" }, errors: []error{ErrVersionCode}, signed: true},
 		{
+			name:     "no project version to keep",
+			spec:     func(spec *Spec) { spec.VersionName = "" },
+			expected: func(expected *Expected) { expected.VersionName = "" },
+			errors:   []error{ErrVersionName},
+			signed:   true,
+		},
+		{
+			name:     "project version too long to keep",
+			spec:     func(spec *Spec) { spec.VersionName = strings.Repeat("1", VersionNameBytes+1) },
+			expected: func(expected *Expected) { expected.VersionName = "" },
+			errors:   []error{ErrVersionName},
+			signed:   true,
+		},
+		{
+			name:     "lease without a version name still checks the version code",
+			spec:     func(spec *Spec) { spec.VersionCode = "46" },
+			expected: func(expected *Expected) { expected.VersionName = "" },
+			errors:   []error{ErrVersionCode},
+			signed:   true,
+		},
+		{
 			name:   "wrong team",
 			spec:   func(spec *Spec) { spec.TeamID = "ZYXWV98765" },
 			errors: []error{ErrTeam},
@@ -312,6 +333,25 @@ func TestMismatch(t *testing.T) {
 			}
 			if test.check != nil {
 				test.check(t, result)
+			}
+		})
+	}
+}
+
+func TestKeepsTheProjectVersion(t *testing.T) {
+	for _, name := range []string{"7.0", strings.Repeat("9", VersionNameBytes)} {
+		t.Run(name, func(t *testing.T) {
+			spec, expected := testSpec(), testExpected()
+			spec.VersionName = name
+			expected.VersionName = ""
+
+			result, err := IPA(writeSample(t, spec), expected, t.TempDir())
+
+			if err != nil {
+				t.Fatalf("IPA: %v", err)
+			}
+			if result.VersionName != name || result.VersionCode != testVersionCode {
+				t.Fatalf("result version %q (%q), want the ipa's %q (%q)", result.VersionName, result.VersionCode, name, testVersionCode)
 			}
 		})
 	}
@@ -667,7 +707,6 @@ func TestRequiresExpectedValues(t *testing.T) {
 	path := writeSample(t, testSpec())
 	for _, clear := range []func(*Expected){
 		func(expected *Expected) { expected.Identifier = "" },
-		func(expected *Expected) { expected.VersionName = "" },
 		func(expected *Expected) { expected.VersionCode = "" },
 		func(expected *Expected) { expected.TeamID = "" },
 	} {
