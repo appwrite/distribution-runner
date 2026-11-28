@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>BuildDate</key>
+	<date>2026-11-23T09:30:15Z</date>
+	<key>CFBundleDisplayName</key>
+	<string>Café ☕ 日本 🚀</string>
+	<key>CFBundleExecutable</key>
+	<string>Golden</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.appwrite.distribution.golden</string>
+	<key>CFBundleShortVersionString</key>
+	<string>2.4.1</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>241</string>
+	<key>Checksum</key>
+	<data>
+	3q2+7wABAgP/
+	</data>
+	<key>Counts</key>
+	<dict>
+		<key>byte</key>
+		<integer>200</integer>
+		<key>maximum</key>
+		<integer>9223372036854775807</integer>
+		<key>negative</key>
+		<integer>-42</integer>
+		<key>pi</key>
+		<real>3.1415899999999999</real>
+		<key>ratio</key>
+		<real>0.5</real>
+		<key>short</key>
+		<integer>65535</integer>
+		<key>small</key>
+		<integer>7</integer>
+		<key>unsigned</key>
+		<integer>18446744073709551615</integer>
+		<key>word</key>
+		<integer>4294967296</integer>
+	</dict>
+	<key>Empty</key>
+	<string></string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>LongString</key>
+	<string>abcdefghijklmnopqrstuvwxyz0123456789</string>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneConfigurationName</key>
+					<string>Default Configuration</string>
+					<key>UISceneDelegateClassName</key>
+					<string>Golden.SceneDelegate</string>
+				</dict>
+				<array>
+					<integer>1</integer>
+					<string>nested</string>
+					<array/>
+					<dict/>
+				</array>
+			</array>
+		</dict>
+	</dict>
+	<key>UIRequiresFullScreen</key>
+	<false/>
+</dict>
+</plist>
